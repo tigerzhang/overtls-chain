@@ -115,7 +115,17 @@ overtls-bin -r client -c config.json
         "keyfile": "/etc/mysite_cert/privkey.pem",
         "forward_addr": "http://127.0.0.1:80",
         "listen_host": "0.0.0.0",
-        "listen_port": 443
+        "listen_port": 443,
+        "chain": {
+            "server_host": "proxy-b.example.com",
+            "server_port": 443,
+            "server_domain": "proxy-b.example.com",
+            "tunnel_path": "/b-tunnel/",
+            "disable_tls": false,
+            "cafile": "",
+            "dangerous_mode": false,
+            "client_id": "proxy-a"
+        }
     },
 
     "client_settings": {
@@ -130,6 +140,7 @@ overtls-bin -r client -c config.json
 配置文件非常簡單。是 `服務端` 和 `客戶端` 通用的， 
 - 當程序以 `服務端` 身份運行時，`server_settings` 部分是有效的，而 `client_settings` 部分是被忽略的；
 - 當程序以 `客戶端` 身份運行時，`client_settings` 部分是有效的，而 `server_settings` 部分是被忽略的。
+- `server_settings.chain` 可選，用於配置上游代理服務器，實現服務器 A 轉發到服務器 B 的鏈式出口。Proxy B 本身仍然只需配置普通 `server_settings`。
 
 `certfile` 和 `keyfile` 爲可選項，配正確後 軟件就變身 https 協議服務端，非翻牆流量直接轉發到 `forward_addr` 指向的目標。
 若 `certfile` 和 `keyfile` 兩項配錯或乾脆不存在，則需要前置的 `反向代理` 如 `nginx` 協助方可工作。

@@ -131,7 +131,17 @@ with `RUST_LOG=overtls=trace` as content.
         "keyfile": "/etc/mysite_cert/privkey.pem",
         "forward_addr": "http://127.0.0.1:80",
         "listen_host": "0.0.0.0",
-        "listen_port": 443
+        "listen_port": 443,
+        "chain": {
+            "server_host": "proxy-b.example.com",
+            "server_port": 443,
+            "server_domain": "proxy-b.example.com",
+            "tunnel_path": "/b-tunnel/",
+            "disable_tls": false,
+            "cafile": "",
+            "dangerous_mode": false,
+            "client_id": "proxy-a"
+        }
     },
 
     "client_settings": {
@@ -147,6 +157,8 @@ with `RUST_LOG=overtls=trace` as content.
 The configuration file is very simple. It is common to both `server` and `client`.
 -    When the application is running as a `server`, the `server_settings` section is valid and the `client_settings` section is ignored.
 -    When the program is run as a `client`, the `client_settings` section is valid and the `server_settings` section is ignored.
+
+-    The `server_settings.chain` section configures an optional upstream proxy server for chained egress. Proxy A uses `chain` to connect to Proxy B, and Proxy B remains an ordinary `server_settings` server.
 
 The `certfile` and `keyfile` are optional, and the software will become `https` protocol server after the correct pairing, and the non-flip traffic will be forwarded directly to the `forward_addr` destination. If the `certfile` and `keyfile` are incorrectly matched or simply do not exist, you will need the help of a previous `reverse proxy` such as `nginx` to work.
 

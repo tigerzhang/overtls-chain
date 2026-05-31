@@ -1,6 +1,6 @@
 use crate::{
     addess_to_b64str,
-    config::Config,
+    config::{Client, Config},
     error::{Error, Result},
     server::{END_SESSION, REMOTE_EOF, START_SESSION},
     tls::*,
@@ -17,7 +17,10 @@ use socks5_impl::{
         connection::connect::NeedReply,
     },
 };
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -304,6 +307,57 @@ where
     Ok(())
 }
 
+pub(crate) async fn create_chain_ws_stream(
+    chain: &crate::config::Chain,
+    dst_addr: Option<Address>,
+    udp_tunnel: Option<bool>,
+) -> Result<WsBoxStream> {
+    let mut client = Client::default();
+    client.disable_tls = chain.disable_tls;
+    client.client_id = chain.client_id.clone();
+    client.server_host = chain.server_host.clone();
+    client.server_port = chain.server_port;
+    client.server_domain = chain.server_domain.clone();
+    client.cafile = chain.cafile.clone();
+    client.dangerous_mode = chain.dangerous_mode;
+    client.listen_host = String::new();
+    client.listen_port = 0;
+    let config = Config {
+        client: Some(client),
+        tunnel_path: chain.tunnel_path.clone().unwrap_or_default(),
+        ..Config::default()
+    };
+
+    let server_addr = match chain.server_ip_addr {
+        Some(addr) => addr,
+        None => {
+            let mut addrs = (chain.server_host.as_str(), chain.server_port).to_socket_addrs()?;
+            addrs.next().ok_or("chain server ip addr not set")?
+        }
+    };
+
+    if chain.disable_tls.unwrap_or(false) {
+        let stream = crate::tcp_stream::tokio_create(server_addr).await?;
+        let boxed: BoxStream = Box::new(stream);
+        return create_ws_stream(dst_addr, &config, udp_tunnel, boxed).await;
+    }
+
+    let stream: BoxStream = if chain.dangerous_mode.unwrap_or(false) {
+        log::warn!("Dangerous mode enabled on chain, skipping certificate verification.");
+        let domain = chain.server_domain.as_ref().unwrap_or(&chain.server_host);
+        let tls_stream = create_dangerous_tls_client_stream(server_addr, domain).await?;
+        Box::new(tls_stream)
+    } else {
+        let cert_content = chain.certificate_content();
+        let cert_store = retrieve_root_cert_store_for_client(&cert_content)?;
+        let domain = chain.server_domain.as_ref().unwrap_or(&chain.server_host);
+        let tls_stream = create_tls_client_stream(cert_store, server_addr, domain).await?;
+        Box::new(tls_stream)
+    };
+
+    create_ws_stream(dst_addr, &config, udp_tunnel, stream).await
+}
+
 pub(crate) async fn create_tls_ws_stream(
     svr_addr: SocketAddr,
     dst_addr: Option<Address>,
@@ -381,6 +435,11 @@ pub(crate) async fn create_ws_stream<S: AsyncRead + AsyncWrite + Unpin>(
 
 type WsStream = WebSocketStream<TcpStream>;
 type WsTlsStream = WebSocketStream<TlsStream<TcpStream>>;
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
+
+type BoxStream = Box<dyn AsyncReadWrite + Unpin + Send>;
+pub(crate) type WsBoxStream = WebSocketStream<BoxStream>;
 
 use connection_pool::{ConnectionManager, ConnectionPool};
 use std::future::Future;
@@ -455,5 +514,164 @@ impl ConnectionManager for WsTlsConnectionManager {
             }
             matches!(tokio::time::timeout(VALID_TEST_TIMEOUT, stream.next()).await, Ok(Some(_)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+    use tokio_tungstenite::{accept_async, connect_async};
+
+    #[tokio::test]
+    async fn test_create_chain_ws_stream_to_local_plaintext_server() -> Result<()> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let mut ws = accept_async(socket).await?;
+            let msg = ws.next().await.ok_or("no initial message")??;
+            assert!(matches!(msg, Message::Text(text) if text.starts_with(START_SESSION)));
+            ws.send(Message::Text(START_SESSION.into())).await?;
+            Ok::<(), Error>(())
+        });
+
+        let chain = crate::config::Chain {
+            disable_tls: Some(true),
+            client_id: Some("proxy-a".to_string()),
+            server_host: "127.0.0.1".to_string(),
+            server_port: addr.port(),
+            server_domain: Some("127.0.0.1".to_string()),
+            tunnel_path: Some(crate::config::TunnelPath::Single("/b-tunnel/".to_string())),
+            ..Default::default()
+        };
+
+        let mut ws = create_chain_ws_stream(&chain, None, None).await?;
+        let target = Address::from(("127.0.0.1", 80));
+        let text = format!("{}:{}", START_SESSION, addess_to_b64str(&target, false));
+        ws.send(Message::Text(text.into())).await?;
+
+        let msg = ws.next().await.ok_or("no response from server")??;
+        assert_eq!(msg, Message::Text(START_SESSION.into()));
+
+        server.await.unwrap()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_svr_chain_tunnel_forwards_start_session_confirmation() -> Result<()> {
+        let b_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let b_addr = b_listener.local_addr()?;
+
+        let b_server = tokio::spawn(async move {
+            let (socket, _) = b_listener.accept().await?;
+            let mut ws = accept_async(socket).await?;
+
+            let msg = ws.next().await.ok_or("no start-session from A")??;
+            assert!(matches!(msg, Message::Text(text) if text.starts_with(START_SESSION)));
+            ws.send(Message::Text(START_SESSION.into())).await?;
+
+            Ok::<(), Error>(())
+        });
+
+        let chain = crate::config::Chain {
+            disable_tls: Some(true),
+            client_id: Some("proxy-a".to_string()),
+            server_host: "127.0.0.1".to_string(),
+            server_port: b_addr.port(),
+            server_domain: Some("127.0.0.1".to_string()),
+            tunnel_path: Some(crate::config::TunnelPath::Single("/b-tunnel/".to_string())),
+            ..Default::default()
+        };
+
+        let a_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let a_addr = a_listener.local_addr()?;
+
+        let a_chain = chain.clone();
+        let a_server = tokio::spawn(async move {
+            let (socket, _) = a_listener.accept().await?;
+            let ws = accept_async(socket).await?;
+            let traffic_audit = Arc::new(tokio::sync::Mutex::new(crate::traffic_audit::TrafficAudit::new()));
+            let config = crate::config::Config {
+                tunnel_path: crate::config::TunnelPath::Single("/tunnel/".to_string()),
+                ..Default::default()
+            };
+            crate::server::svr_chain_tunnel(ws, a_addr, config, traffic_audit, &None, None, a_chain).await
+        });
+
+        let (mut client_ws, _) = connect_async(format!("ws://127.0.0.1:{}/tunnel/", a_addr.port())).await?;
+        let target = Address::from(("127.0.0.1", 80));
+        let start_msg = format!("{}:{}", START_SESSION, addess_to_b64str(&target, false));
+        client_ws.send(Message::Text(start_msg.into())).await?;
+
+        let msg = client_ws.next().await.ok_or("no confirmation from A")??;
+        assert_eq!(msg, Message::Text(START_SESSION.into()));
+
+        a_server.await.unwrap()?;
+        b_server.await.unwrap()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_svr_udp_chain_tunnel_forwards_binary() -> Result<()> {
+        let b_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let b_addr = b_listener.local_addr()?;
+
+        let b_server = tokio::spawn(async move {
+            let (socket, _) = b_listener.accept().await?;
+            let mut ws = accept_async(socket).await?;
+            while let Some(msg) = ws.next().await {
+                let msg = msg?;
+                match msg {
+                    Message::Binary(data) => {
+                        ws.send(Message::Binary(data)).await?;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            Ok::<(), Error>(())
+        });
+
+        let chain = crate::config::Chain {
+            disable_tls: Some(true),
+            client_id: Some("proxy-a".to_string()),
+            server_host: "127.0.0.1".to_string(),
+            server_port: b_addr.port(),
+            server_domain: Some("127.0.0.1".to_string()),
+            tunnel_path: Some(crate::config::TunnelPath::Single("/b-tunnel/".to_string())),
+            ..Default::default()
+        };
+
+        let a_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let a_addr = a_listener.local_addr()?;
+
+        let a_chain = chain.clone();
+        let a_server = tokio::spawn(async move {
+            let (socket, _) = a_listener.accept().await?;
+            let ws = accept_async(socket).await?;
+            let traffic_audit = Arc::new(Mutex::new(crate::traffic_audit::TrafficAudit::new()));
+            let config = crate::config::Config {
+                tunnel_path: crate::config::TunnelPath::Single("/tunnel/".to_string()),
+                ..Default::default()
+            };
+            crate::server::svr_udp_chain_tunnel(ws, config, traffic_audit, &None, a_chain).await
+        });
+
+        let (mut client_ws, _) = connect_async(format!("ws://127.0.0.1:{}/tunnel/", a_addr.port())).await?;
+        let payload = b"udp-chain-test".to_vec();
+        client_ws.send(Message::Binary(payload.clone().into())).await?;
+
+        let msg = client_ws.next().await.ok_or("no response from A")??;
+        assert_eq!(msg, Message::Binary(payload.into()));
+
+        client_ws.close(None).await?;
+        a_server.await.unwrap()?;
+        b_server.await.unwrap()?;
+        Ok(())
     }
 }

@@ -7,17 +7,28 @@
     "server_settings": {
         "disable_tls": false,
         "manage_clients": {
-            "enabled": false,
+            "enable": false,
             "node_id": 1,
             "api_update_time": 60,
             "webapi_url": "https://sspanelhost.com:443/",
             "webapi_token": "secret-token"
         },
+        "allow_private_network": false,
         "certfile": "/etc/mysite_cert/fullchain.pem",
         "keyfile": "/etc/mysite_cert/privkey.pem",
         "forward_addr": "http://127.0.0.1:80",
         "listen_host": "0.0.0.0",
-        "listen_port": 443
+        "listen_port": 443,
+        "chain": {
+            "disable_tls": false,
+            "client_id": "proxy-a",
+            "server_host": "proxy-b.example.com",
+            "server_port": 443,
+            "server_domain": "proxy-b.example.com",
+            "tunnel_path": "/b-tunnel/",
+            "cafile": "",
+            "dangerous_mode": false
+        }
     },
     "client_settings": {
         "disable_tls": false,

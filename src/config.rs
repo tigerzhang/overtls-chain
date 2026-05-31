@@ -107,14 +107,36 @@ pub struct Server {
     pub disable_tls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manage_clients: Option<ManageClients>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub certfile: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]    pub allow_private_network: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]    pub certfile: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyfile: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forward_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Chain>,
     pub listen_host: String,
     pub listen_port: u16,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct Chain {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_tls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    pub server_host: String,
+    pub server_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cafile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dangerous_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_path: Option<TunnelPath>,
+    #[serde(skip)]
+    pub server_ip_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -178,12 +200,8 @@ impl PartialEq for Client {
     }
 }
 
-impl Client {
-    pub fn certificate_content(&self) -> Option<String> {
-        self.cafile.as_ref().and_then(|cert| Self::_certificate_content(cert))
-    }
-
-    fn _certificate_content(cert: &str) -> Option<String> {
+fn certificate_content_from_option(cert: &Option<String>) -> Option<String> {
+    cert.as_ref().and_then(|cert| {
         const BEGIN_CERT: &str = "-----BEGIN CERTIFICATE-----";
         let checker = |s: &str| !s.is_empty() && s.starts_with(BEGIN_CERT) && s.len() > 100;
         if PathBuf::from(cert).exists() {
@@ -193,6 +211,12 @@ impl Client {
         } else {
             None
         }
+    })
+}
+
+impl Client {
+    pub fn certificate_content(&self) -> Option<String> {
+        certificate_content_from_option(&self.cafile)
     }
 
     pub fn export_certificate<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
@@ -200,6 +224,16 @@ impl Client {
             Some(cert) => std::fs::write(path, cert).map_err(|e| e.into()),
             None => Err(Error::from("certificate not exists")),
         }
+    }
+
+    pub fn server_ip_addr(&self) -> Option<SocketAddr> {
+        self.server_ip_addr
+    }
+}
+
+impl Chain {
+    pub fn certificate_content(&self) -> Option<String> {
+        certificate_content_from_option(&self.cafile)
     }
 
     pub fn server_ip_addr(&self) -> Option<SocketAddr> {
@@ -222,6 +256,10 @@ impl Config {
             s.manage_clients.as_ref().map(f2).unwrap_or(false)
         };
         self.server.as_ref().map(f).unwrap_or(false)
+    }
+
+    pub fn allow_private_network(&self) -> bool {
+        self.server.as_ref().and_then(|s| s.allow_private_network).unwrap_or(false)
     }
 
     pub fn webapi_url(&self) -> Option<String> {
@@ -329,6 +367,26 @@ impl Config {
         false
     }
 
+    pub fn chain_disable_tls(&self) -> bool {
+        self.server
+            .as_ref()
+            .and_then(|s| s.chain.as_ref())
+            .and_then(|c| c.disable_tls)
+            .unwrap_or(false)
+    }
+
+    pub fn chain_dangerous_mode(&self) -> bool {
+        self.server
+            .as_ref()
+            .and_then(|s| s.chain.as_ref())
+            .and_then(|c| c.dangerous_mode)
+            .unwrap_or(false)
+    }
+
+    pub fn chain(&self) -> Option<&Chain> {
+        self.server.as_ref().and_then(|s| s.chain.as_ref())
+    }
+
     pub fn set_dangerous_mode(&mut self, dangerous_mode: bool) {
         if let Some(c) = &mut self.client {
             c.dangerous_mode = Some(dangerous_mode);
@@ -371,6 +429,42 @@ impl Config {
             }
             if server.listen_port == 0 {
                 server.listen_port = 443;
+            }
+
+            if let Some(chain) = &mut server.chain {
+                let chain_host = chain.server_host.clone();
+                let chain_host = match (chain_host.is_empty(), chain.server_domain.clone()) {
+                    (true, Some(domain)) => match domain.is_empty() {
+                        true => return Err(Error::from("We need upstream server host in chain settings")),
+                        false => domain,
+                    },
+                    (true, None) => return Err(Error::from("We need upstream server host in chain settings")),
+                    (false, _) => chain_host,
+                };
+                if chain.server_host.is_empty() {
+                    chain.server_host.clone_from(&chain_host);
+                }
+                if chain.server_domain.is_none() || chain.server_domain.as_ref().unwrap_or(&"".to_string()).is_empty() {
+                    chain.server_domain = Some(chain_host.clone());
+                }
+                if chain.server_port == 0 {
+                    chain.server_port = 443;
+                }
+                if chain.tunnel_path.is_none() {
+                    chain.tunnel_path = Some(TunnelPath::default());
+                }
+                if let Some(tunnel_path) = &mut chain.tunnel_path {
+                    tunnel_path.standardize();
+                }
+
+                let mut addr = (chain_host.clone(), chain.server_port).to_socket_addrs()?;
+                let addr = addr.next().ok_or("upstream chain address not available")?;
+                if addr == SocketAddr::new(server.listen_host.parse()?, server.listen_port) {
+                    return Err(Error::from("chain server cannot point to the local listen address"));
+                }
+                let timeout = std::time::Duration::from_secs(self.test_timeout_secs.unwrap_or(TEST_TIMEOUT_SECS));
+                crate::tcp_stream::std_create(addr, Some(timeout))?;
+                chain.server_ip_addr = Some(addr);
             }
         }
         if let Some(client) = &mut self.client {
@@ -594,4 +688,39 @@ fn test_config() {
     println!("{config2:?}");
 
     assert_eq!(config, config2);
+}
+
+#[test]
+fn test_chain_config_validation() {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+
+    let chain = Chain {
+        server_host: Ipv4Addr::LOCALHOST.to_string(),
+        server_port: local_port,
+        server_domain: Some(Ipv4Addr::LOCALHOST.to_string()),
+        tunnel_path: Some(TunnelPath::Single("/b-tunnel/".to_string())),
+        ..Chain::default()
+    };
+
+    let server = Server {
+        listen_host: Ipv4Addr::LOCALHOST.to_string(),
+        listen_port: 0,
+        chain: Some(chain),
+        ..Server::default()
+    };
+
+    let mut config = Config {
+        tunnel_path: TunnelPath::Single("/tunnel/".to_string()),
+        server: Some(server),
+        test_timeout_secs: Some(1),
+        ..Config::default()
+    };
+
+    config.check_correctness(true).unwrap();
+
+    let chain = config.server.as_ref().unwrap().chain.as_ref().unwrap();
+    assert!(chain.server_ip_addr.is_some());
+    assert_eq!(chain.server_port, local_port);
+    assert_eq!(chain.tunnel_path.as_ref().unwrap().extract(), vec!["/b-tunnel/"]);
 }

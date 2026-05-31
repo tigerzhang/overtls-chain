@@ -1,5 +1,5 @@
 use crate::{
-    b64str_to_address,
+    addess_to_b64str, b64str_to_address, client,
     config::{Config, TEST_TIMEOUT_SECS},
     error::{Error, Result},
     tls::*,
@@ -299,16 +299,23 @@ async fn websocket_traffic_handler<S: AsyncRead + AsyncWrite + Unpin>(
     let result;
     if udp_tunnel {
         log::trace!("[UDP] {peer} tunneling established");
-        result = svr_udp_tunnel(ws_stream, config, traffic_audit, &client_id).await;
+        if let Some(chain) = config.chain().cloned() {
+            result = svr_udp_chain_tunnel(ws_stream, config, traffic_audit, &client_id, chain).await;
+        } else {
+            result = svr_udp_tunnel(ws_stream, config, traffic_audit, &client_id).await;
+        }
         if let Err(ref e) = result {
             log::debug!("[UDP] {peer} closed with error \"{e}\"");
         } else {
             log::trace!("[UDP] {peer} closed.");
         }
+    } else if let Some(chain) = config.chain().cloned() {
+        result = svr_chain_tunnel(ws_stream, peer, config, traffic_audit, &client_id, target_address, chain).await;
+        log::trace!("{peer} connection closed with {result:?}.");
     } else {
         let stream = if let Some(target_address) = &target_address {
             let time_out = std::time::Duration::from_secs(config.test_timeout_secs.unwrap_or(TEST_TIMEOUT_SECS));
-            let stream = tcp_stream_from_s5_address(target_address, time_out, peer)?;
+            let stream = tcp_stream_from_s5_address(target_address, time_out, peer, config.allow_private_network())?;
             let successful_addr = stream.peer_addr()?;
             log::trace!("{peer} -> {successful_addr} {client_id:?} uri path: \"{uri_path}\"");
             let stream = tokio::net::TcpStream::from_std(stream)?;
@@ -380,7 +387,7 @@ async fn svr_normal_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                             }
 
                             let time_out = std::time::Duration::from_secs(config.test_timeout_secs.unwrap_or(TEST_TIMEOUT_SECS));
-                            match tcp_stream_from_s5_address(&dst_address, time_out, peer) {
+                            match tcp_stream_from_s5_address(&dst_address, time_out, peer, config.allow_private_network()) {
                                 Ok(stream) => {
                                     let stream = tokio::net::TcpStream::from_std(stream)?;
                                     dst_addr = Some(stream.peer_addr()?);
@@ -457,6 +464,242 @@ async fn svr_normal_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                         let msg = Message::Text(END_SESSION.into());
                         log::debug!("{peer} <> {dst_addr:?} sending text message '{END_SESSION}' to end session because '{e}'");
                         svr_send_ws_message(&mut ws_stream, msg, &traffic_audit, client_id).await?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
+    mut ws_stream: WebSocketStream<S>,
+    peer: SocketAddr,
+    _config: Config,
+    traffic_audit: TrafficAuditPtr,
+    client_id: &Option<String>,
+    initial_target: Option<Address>,
+    chain: crate::config::Chain,
+) -> Result<()> {
+    let mut outgoing: Option<client::WsBoxStream> = None;
+    let mut dst_addr = initial_target;
+
+    if let Some(target_address) = dst_addr.clone() {
+        match client::create_chain_ws_stream(&chain, None, None).await {
+            Ok(mut stream) => {
+                let msg = Message::Text(format!("{}:{}", START_SESSION, addess_to_b64str(&target_address, false)).into());
+                stream.send(msg).await?;
+                outgoing = Some(stream);
+            }
+            Err(e) => {
+                log::error!("{peer} failed to create chain session to upstream: {e}");
+                let msg = Message::Text(END_SESSION.into());
+                svr_send_ws_message(&mut ws_stream, msg, &traffic_audit, client_id).await?;
+                dst_addr = None;
+            }
+        }
+    }
+
+    loop {
+        tokio::select! {
+            msg = ws_stream.next() => {
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => return Err(err.into()),
+                    None => break,
+                };
+                let len = (msg.len() + WS_MSG_HEADER_LEN) as u64;
+                if let Some(client_id) = &client_id {
+                    traffic_audit.lock().await.add_upstream_traffic_of(client_id, len);
+                }
+                match msg {
+                    Message::Close(_) => {
+                        log::debug!("{peer} <> {dst_addr:?} incoming connection closed normally");
+                        break;
+                    }
+                    Message::Binary(data) => {
+                        let len = data.len();
+                        if let Some(outgoing) = &mut outgoing {
+                            outgoing.send(Message::Binary(data.clone())).await?;
+                            log::trace!("{peer} -> {dst_addr:?} length {}", len);
+                        } else {
+                            log::warn!("{peer} -> no outgoing chain available, dropping data len = {}", len);
+                        }
+                    }
+                    Message::Text(ref data) => {
+                        let msg_str = data.as_str();
+                        if let Some(reason) = msg_str.strip_prefix(END_SESSION) {
+                            let reason = reason.strip_prefix(':').unwrap_or(reason).trim();
+                            log::debug!("{peer} <> {dst_addr:?} ended session with '{END_SESSION}' message with '{reason}'");
+                            if let Some(outgoing) = &mut outgoing {
+                                outgoing.send(Message::Text(END_SESSION.into())).await?;
+                            }
+                            dst_addr = None;
+                        } else if let Some(dst_addr_str) = msg_str.strip_prefix(START_SESSION) {
+                            let dst_addr_str = dst_addr_str.strip_prefix(':').map(|s| s.trim()).unwrap_or("");
+                            let dst_address = b64str_to_address(dst_addr_str, false).unwrap_or(Address::unspecified());
+                            if dst_addr.is_some() {
+                                if let Some(outgoing) = &mut outgoing {
+                                    outgoing.send(Message::Text(END_SESSION.into())).await?;
+                                }
+                            }
+                            dst_addr = Some(dst_address.clone());
+                            if outgoing.is_none() {
+                                outgoing = Some(client::create_chain_ws_stream(&chain, None, None).await?);
+                            }
+                            let msg = Message::Text(format!("{}:{}", START_SESSION, addess_to_b64str(&dst_address, false)).into());
+                            if let Some(outgoing) = &mut outgoing {
+                                outgoing.send(msg).await?;
+                            }
+                        } else {
+                            log::warn!("{peer} -> {dst_addr:?} received text message len = {} in unexpected state", data.len());
+                        }
+                    }
+                    Message::Ping(_data) => {
+                        log::debug!("{peer} -> {dst_addr:?} received ping message");
+                    }
+                    Message::Pong(_data) => {
+                        log::debug!("{peer} -> {dst_addr:?} received pong message");
+                    }
+                    _ => {
+                        log::debug!("{peer} -> {dst_addr:?} received unexpected message len {}, ignoring", msg.len());
+                    }
+                }
+            }
+            msg = async {
+                if let Some(outgoing) = &mut outgoing {
+                    outgoing.next().await
+                } else {
+                    futures_util::future::pending::<Option<Result<Message, tokio_tungstenite::tungstenite::Error>>>().await
+                }
+            } => {
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => {
+                        log::error!("{peer} outgoing chain websocket error: {err}");
+                        if let Some(mut outgoing) = outgoing.take() {
+                            let _ = outgoing.close(None).await;
+                        }
+                        break;
+                    }
+                    None => {
+                        if outgoing.is_some() {
+                            log::debug!("{peer} outgoing chain websocket closed");
+                        }
+                        break;
+                    }
+                };
+                match msg {
+                    Message::Close(_) => {
+                        log::debug!("{peer} outgoing chain websocket closed by upstream");
+                        outgoing = None;
+                        dst_addr = None;
+                        let msg = Message::Text(END_SESSION.into());
+                        svr_send_ws_message(&mut ws_stream, msg, &traffic_audit, client_id).await?;
+                    }
+                    Message::Binary(data) => {
+                        log::trace!("{peer} <- {dst_addr:?} length {}", data.len());
+                        svr_send_ws_message(&mut ws_stream, Message::Binary(data), &traffic_audit, client_id).await?;
+                    }
+                    Message::Text(data) => {
+                        let msg_str = data.as_str();
+                        if msg_str.starts_with(START_SESSION) {
+                            log::debug!("{peer} <- {dst_addr:?} received '{START_SESSION}' confirmation from upstream");
+                            svr_send_ws_message(&mut ws_stream, Message::Text(START_SESSION.into()), &traffic_audit, client_id).await?;
+                        } else if let Some(reason) = msg_str.strip_prefix(END_SESSION) {
+                            let reason = reason.strip_prefix(':').unwrap_or(reason).trim();
+                            log::debug!("{peer} <- {dst_addr:?} ended session by upstream '{END_SESSION}' with reason: '{reason}'");
+                            if dst_addr.is_some() {
+                                dst_addr = None;
+                            }
+                            svr_send_ws_message(&mut ws_stream, Message::Text(data), &traffic_audit, client_id).await?;
+                        } else if msg_str == REMOTE_EOF {
+                            log::debug!("{peer} <- {dst_addr:?} received from upstream the '{REMOTE_EOF}' indication");
+                            svr_send_ws_message(&mut ws_stream, Message::Text(REMOTE_EOF.into()), &traffic_audit, client_id).await?;
+                        } else {
+                            log::warn!("{peer} <- {dst_addr:?} unexpected upstream Websocket text: {msg_str}");
+                        }
+                    }
+                    Message::Ping(_) => {
+                        log::trace!("{peer} <- {dst_addr:?} upstream ping");
+                    }
+                    Message::Pong(_) => {
+                        log::trace!("{peer} <- {dst_addr:?} upstream pong");
+                    }
+                    _ => {
+                        log::trace!("{peer} <- {dst_addr:?} unexpected upstream message");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
+    mut ws_stream: WebSocketStream<S>,
+    _config: Config,
+    traffic_audit: TrafficAuditPtr,
+    client_id: &Option<String>,
+    chain: crate::config::Chain,
+) -> Result<()> {
+    let mut outgoing: client::WsBoxStream = client::create_chain_ws_stream(&chain, None, Some(true)).await?;
+
+    loop {
+        tokio::select! {
+            msg = ws_stream.next() => {
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => return Err(err.into()),
+                    None => break,
+                };
+                let len = (msg.len() + WS_MSG_HEADER_LEN) as u64;
+                if let Some(client_id) = &client_id {
+                    traffic_audit.lock().await.add_upstream_traffic_of(client_id, len);
+                }
+                match msg {
+                    Message::Close(_) => {
+                        log::trace!("[UDP] incoming client closed");
+                        let _ = outgoing.close(None).await;
+                        break;
+                    }
+                    Message::Binary(data) => {
+                        outgoing.send(Message::Binary(data)).await?;
+                    }
+                    Message::Ping(_) => {
+                        log::trace!("[UDP] received ping from client");
+                    }
+                    Message::Pong(_) => {
+                        log::trace!("[UDP] received pong from client");
+                    }
+                    _ => {
+                        log::warn!("[UDP] unexpected client message {msg:?}, ignoring");
+                    }
+                }
+            }
+            msg = outgoing.next() => {
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => return Err(err.into()),
+                    None => break,
+                };
+                match msg {
+                    Message::Binary(data) => {
+                        svr_send_ws_message(&mut ws_stream, Message::Binary(data), &traffic_audit, client_id).await?;
+                    }
+                    Message::Close(_) => {
+                        log::trace!("[UDP] upstream chain websocket closed");
+                        let _ = ws_stream.close(None).await;
+                        break;
+                    }
+                    Message::Ping(_) => {
+                        log::trace!("[UDP] upstream ping");
+                    }
+                    Message::Pong(_) => {
+                        log::trace!("[UDP] upstream pong");
+                    }
+                    _ => {
+                        log::warn!("[UDP] unexpected upstream message {msg:?}, ignoring");
                     }
                 }
             }
@@ -627,10 +870,10 @@ async fn svr_udp_write_ws_stream<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn tcp_stream_from_s5_address(s5_addr: &Address, time_out: std::time::Duration, peer: SocketAddr) -> Result<std::net::TcpStream> {
+fn tcp_stream_from_s5_address(s5_addr: &Address, time_out: std::time::Duration, peer: SocketAddr, allow_private_network: bool) -> Result<std::net::TcpStream> {
     // try to connect to the first available address
     for dst_addr in s5_addr.to_socket_addrs()? {
-        if addr_is_private(&dst_addr) {
+        if addr_is_private(&dst_addr) && !allow_private_network {
             log::warn!("{peer} <> {dst_addr} destination address is private, skipping");
             continue;
         }
