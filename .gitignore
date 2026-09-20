@@ -16,3 +16,4 @@ tmp/
 dev/
 target/
 Cargo.lock
+overtls-chain-client-config.json
