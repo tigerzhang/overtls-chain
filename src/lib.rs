@@ -6,6 +6,7 @@ pub(crate) mod config;
 pub(crate) mod dns;
 pub(crate) mod dump_logger;
 pub(crate) mod error;
+pub(crate) mod link_stall;
 pub(crate) mod server;
 pub(crate) mod tcp_stream;
 pub(crate) mod tls;

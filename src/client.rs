@@ -98,7 +98,7 @@ async fn client_event_loop<M, S, O>(
 ) -> Result<()>
 where
     M: ConnectionManager<Connection = WebSocketStream<S>> + Send + Sync + 'static,
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncReadWrite + Unpin + Send + 'static,
     O: Send + Sync + 'static,
 {
     let (udp_tx, _, incomings) = udprelay::create_udp_tunnel();
@@ -153,7 +153,7 @@ async fn handle_incoming<IO, S>(
     ws_stream: &mut WebSocketStream<S>,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncReadWrite + Unpin + Send + 'static,
     IO: 'static,
 {
     let peer_addr = conn.peer_addr()?;
@@ -192,7 +192,7 @@ async fn handle_socks5_cmd_connection<S>(
     ws_stream: &mut WebSocketStream<S>,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncReadWrite + Unpin + Send + 'static,
 {
     let incoming = connect.reply(Reply::Succeeded, Address::unspecified()).await?;
 
@@ -207,14 +207,16 @@ where
 async fn client_traffic_loop<T, S>(mut incoming: T, ws_stream: &mut WebSocketStream<S>, src: SocketAddr, dst: Address) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncReadWrite + Unpin,
 {
     // Send "Start session" command with target address
     let b64_addr = addess_to_b64str(&dst, false);
     let start_cmd = format!("{START_SESSION}:{b64_addr}");
     ws_stream.send(Message::Text(start_cmd.into())).await?;
 
-    let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut link_health = crate::link_stall::LinkHealth::new();
+    let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
+    link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut session_confirmed = false;
     let mut shutdown_deadline: Option<tokio::time::Instant> = None;
     loop {
@@ -246,6 +248,7 @@ where
             }
             result = ws_stream.next() => {
                 let msg = result.ok_or("message not exist")??;
+                link_health.on_inbound();
 
                 if let Err(e) = crate::traffic_status::traffic_status_update(0, msg.len()) {
                     log::error!("{e}");
@@ -286,9 +289,20 @@ where
                     _ => {}
                 }
             }
-            _ = timer.tick() => {
-                ws_stream.send(Message::Ping(vec![].into())).await?;
-                log::trace!("{src} -> {dst} Websocket ping from local");
+            _ = link_check.tick() => {
+                let stats = ws_stream.get_ref().tcp_link_stats();
+                match link_health.poll(stats) {
+                    crate::link_stall::LinkCheck::Reset(reason) => {
+                        log::warn!("{src} <> {dst} upstream link stalled ({reason}), resetting");
+                        let _ = ws_stream.close(None).await;
+                        return Err(Error::from(format!("upstream link stalled ({reason})")));
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: true } => {
+                        ws_stream.send(Message::Ping(vec![].into())).await?;
+                        log::trace!("{src} -> {dst} Websocket ping from local");
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
+                }
             }
             _ = async {
                 if let Some(deadline) = shutdown_deadline.take() {
@@ -435,8 +449,32 @@ pub(crate) async fn create_ws_stream<S: AsyncRead + AsyncWrite + Unpin>(
 
 type WsStream = WebSocketStream<TcpStream>;
 type WsTlsStream = WebSocketStream<TlsStream<TcpStream>>;
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
-impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {
+    fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
+        None
+    }
+}
+
+impl AsyncReadWrite for TcpStream {
+    fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
+        crate::link_stall::tcp_stats_of_stream(self)
+    }
+}
+
+impl AsyncReadWrite for TlsStream<TcpStream> {
+    fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
+        crate::link_stall::tcp_stats_of_stream(self.get_ref().0)
+    }
+}
+
+impl<T> AsyncReadWrite for Box<T>
+where
+    T: AsyncReadWrite + Unpin + ?Sized,
+{
+    fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
+        (**self).tcp_link_stats()
+    }
+}
 
 type BoxStream = Box<dyn AsyncReadWrite + Unpin + Send>;
 pub(crate) type WsBoxStream = WebSocketStream<BoxStream>;
@@ -472,13 +510,7 @@ impl ConnectionManager for WsPlainConnectionManager {
     }
 
     fn is_valid<'a>(&'a self, stream: &'a mut Self::Connection) -> Self::ValidFut<'a> {
-        Box::pin(async move {
-            let r = tokio::time::timeout(VALID_TEST_TIMEOUT, stream.send(Message::Ping(vec![].into()))).await;
-            if !matches!(r, Ok(Ok(_))) {
-                return false;
-            }
-            matches!(tokio::time::timeout(VALID_TEST_TIMEOUT, stream.next()).await, Ok(Some(_)))
-        })
+        Box::pin(async move { ws_link_is_usable(stream).await })
     }
 }
 
@@ -507,14 +539,25 @@ impl ConnectionManager for WsTlsConnectionManager {
     }
 
     fn is_valid<'a>(&'a self, stream: &'a mut Self::Connection) -> Self::ValidFut<'a> {
-        Box::pin(async move {
-            let r = tokio::time::timeout(VALID_TEST_TIMEOUT, stream.send(Message::Ping(vec![].into()))).await;
-            if !matches!(r, Ok(Ok(_))) {
-                return false;
-            }
-            matches!(tokio::time::timeout(VALID_TEST_TIMEOUT, stream.next()).await, Ok(Some(_)))
-        })
+        Box::pin(async move { ws_link_is_usable(stream).await })
     }
+}
+
+async fn ws_link_is_usable<S>(stream: &mut WebSocketStream<S>) -> bool
+where
+    S: AsyncReadWrite + Unpin,
+{
+    if let Some(stats) = stream.get_ref().tcp_link_stats()
+        && stats.is_stalled()
+    {
+        log::warn!("upstream link stalled ({stats}), dropping it so a new one is opened");
+        return false;
+    }
+    let r = tokio::time::timeout(VALID_TEST_TIMEOUT, stream.send(Message::Ping(vec![].into()))).await;
+    if !matches!(r, Ok(Ok(_))) {
+        return false;
+    }
+    matches!(tokio::time::timeout(VALID_TEST_TIMEOUT, stream.next()).await, Ok(Some(_)))
 }
 
 #[cfg(test)]

@@ -169,16 +169,21 @@ pub(crate) async fn run_udp_loop(udp_tx: UdpRequestSender, incomings: SocketAddr
     Ok(())
 }
 
-async fn _run_udp_loop<S: AsyncRead + AsyncWrite + Unpin>(
+async fn _run_udp_loop<S>(
     udp_tx: UdpRequestSender,
     incomings: SocketAddrHashSet,
     mut ws_stream: WebSocketStream<S>,
     cache_dns: bool,
     max_lifetime: Option<u64>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + crate::client::AsyncReadWrite,
+{
     let mut udp_rx = udp_tx.subscribe();
 
-    let mut timer = tokio::time::interval(Duration::from_secs(30));
+    let mut link_health = crate::link_stall::LinkHealth::new();
+    let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
+    link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Set the maximum lifetime for the UDP loop to 1 hour to evade GFW censorship.
     let max_lifetime = Duration::from_secs(max_lifetime.unwrap_or(3600));
@@ -238,6 +243,7 @@ async fn _run_udp_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         break;
                     }
                 };
+                link_health.on_inbound();
 
                 match msg {
                     Message::Binary(buf) => {
@@ -273,9 +279,21 @@ async fn _run_udp_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 Ok::<_, Error>(())
             },
-            _ = timer.tick() => {
-                ws_stream.send(Message::Ping(vec![].into())).await?;
-                log::trace!("[UDP] Websocket ping from local");
+            _ = link_check.tick() => {
+                let stats = ws_stream.get_ref().tcp_link_stats();
+                match link_health.poll(stats) {
+                    crate::link_stall::LinkCheck::Reset(reason) => {
+                        log::warn!("[UDP] upstream link stalled ({reason}), resetting");
+                        let _ = ws_stream.close(None).await;
+                        res = Err(Error::from(format!("upstream link stalled ({reason})")));
+                        break;
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: true } => {
+                        ws_stream.send(Message::Ping(vec![].into())).await?;
+                        log::trace!("[UDP] Websocket ping from local");
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
+                }
                 Ok::<_, Error>(())
             },
             _ = &mut lifetime => {

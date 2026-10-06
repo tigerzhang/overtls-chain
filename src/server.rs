@@ -483,6 +483,9 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut outgoing: Option<client::WsBoxStream> = None;
     let mut dst_addr = initial_target;
+    let mut link_health = crate::link_stall::LinkHealth::new();
+    let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
+    link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if let Some(target_address) = dst_addr.clone() {
         match client::create_chain_ws_stream(&chain, None, None).await {
@@ -589,6 +592,7 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                         break;
                     }
                 };
+                link_health.on_inbound();
                 match msg {
                     Message::Close(_) => {
                         log::debug!("{peer} outgoing chain websocket closed by upstream");
@@ -631,8 +635,52 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
+            _ = link_check.tick() => {
+                let stats = outgoing.as_ref().and_then(|stream| stream.get_ref().tcp_link_stats());
+                match link_health.poll(stats) {
+                    crate::link_stall::LinkCheck::Reset(reason) => {
+                        log::warn!("{peer} chain upstream link stalled ({reason}), resetting");
+                        if let Err(e) = replace_chain_link(&mut outgoing, &chain, false).await {
+                            log::error!("{peer} failed to reset chain link: {e}");
+                        }
+                        if dst_addr.take().is_some()
+                            && let Err(e) = svr_send_ws_message(&mut ws_stream, Message::Text(END_SESSION.into()), &traffic_audit, client_id).await
+                        {
+                            log::debug!("{peer} failed to end session after link reset: {e}");
+                            break;
+                        }
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: true } => {
+                        if let Some(stream) = &mut outgoing
+                            && let Err(e) = stream.send(Message::Ping(vec![].into())).await
+                        {
+                            log::warn!("{peer} chain upstream ping failed ({e}), resetting");
+                            if let Err(err) = replace_chain_link(&mut outgoing, &chain, false).await {
+                                log::error!("{peer} failed to reset chain link: {err}");
+                            }
+                            if dst_addr.take().is_some()
+                                && let Err(err) =
+                                    svr_send_ws_message(&mut ws_stream, Message::Text(END_SESSION.into()), &traffic_audit, client_id).await
+                            {
+                                log::debug!("{peer} failed to end session after link reset: {err}");
+                                break;
+                            }
+                        }
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
+                }
+            }
         }
     }
+    Ok(())
+}
+
+async fn replace_chain_link(outgoing: &mut Option<client::WsBoxStream>, chain: &crate::config::Chain, udp: bool) -> Result<()> {
+    if let Some(mut old) = outgoing.take() {
+        let _ = old.close(None).await;
+    }
+    let udp_tunnel = if udp { Some(true) } else { None };
+    *outgoing = Some(client::create_chain_ws_stream(chain, None, udp_tunnel).await?);
     Ok(())
 }
 
@@ -643,7 +691,11 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     client_id: &Option<String>,
     chain: crate::config::Chain,
 ) -> Result<()> {
-    let mut outgoing: client::WsBoxStream = client::create_chain_ws_stream(&chain, None, Some(true)).await?;
+    let mut outgoing: Option<client::WsBoxStream> = None;
+    replace_chain_link(&mut outgoing, &chain, true).await?;
+    let mut link_health = crate::link_stall::LinkHealth::new();
+    let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
+    link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -660,10 +712,16 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 match msg {
                     Message::Close(_) => {
                         log::trace!("[UDP] incoming client closed");
-                        let _ = outgoing.close(None).await;
+                        if let Some(mut outgoing) = outgoing.take() {
+                            let _ = outgoing.close(None).await;
+                        }
                         break;
                     }
                     Message::Binary(data) => {
+                        if outgoing.is_none() {
+                            replace_chain_link(&mut outgoing, &chain, true).await?;
+                        }
+                        let outgoing = outgoing.as_mut().ok_or("udp chain link missing")?;
                         outgoing.send(Message::Binary(data)).await?;
                     }
                     Message::Ping(_) => {
@@ -677,12 +735,18 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
-            msg = outgoing.next() => {
+            msg = async {
+                match outgoing.as_mut() {
+                    Some(stream) => stream.next().await,
+                    None => futures_util::future::pending().await,
+                }
+            } => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
                     Some(Err(err)) => return Err(err.into()),
                     None => break,
                 };
+                link_health.on_inbound();
                 match msg {
                     Message::Binary(data) => {
                         svr_send_ws_message(&mut ws_stream, Message::Binary(data), &traffic_audit, client_id).await?;
@@ -701,6 +765,26 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     _ => {
                         log::warn!("[UDP] unexpected upstream message {msg:?}, ignoring");
                     }
+                }
+            }
+            _ = link_check.tick() => {
+                let stats = outgoing.as_ref().and_then(|stream| stream.get_ref().tcp_link_stats());
+                match link_health.poll(stats) {
+                    crate::link_stall::LinkCheck::Reset(reason) => {
+                        log::warn!("[UDP] chain upstream link stalled ({reason}), resetting");
+                        if let Err(e) = replace_chain_link(&mut outgoing, &chain, true).await {
+                            return Err(e);
+                        }
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: true } => {
+                        if let Some(stream) = &mut outgoing
+                            && let Err(e) = stream.send(Message::Ping(vec![].into())).await
+                        {
+                            log::warn!("[UDP] chain upstream ping failed ({e}), resetting");
+                            replace_chain_link(&mut outgoing, &chain, true).await?;
+                        }
+                    }
+                    crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
                 }
             }
         }
@@ -870,7 +954,12 @@ async fn svr_udp_write_ws_stream<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn tcp_stream_from_s5_address(s5_addr: &Address, time_out: std::time::Duration, peer: SocketAddr, allow_private_network: bool) -> Result<std::net::TcpStream> {
+fn tcp_stream_from_s5_address(
+    s5_addr: &Address,
+    time_out: std::time::Duration,
+    peer: SocketAddr,
+    allow_private_network: bool,
+) -> Result<std::net::TcpStream> {
     // try to connect to the first available address
     for dst_addr in s5_addr.to_socket_addrs()? {
         if addr_is_private(&dst_addr) && !allow_private_network {

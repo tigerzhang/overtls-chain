@@ -107,8 +107,10 @@ pub struct Server {
     pub disable_tls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manage_clients: Option<ManageClients>,
-    #[serde(skip_serializing_if = "Option::is_none")]    pub allow_private_network: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]    pub certfile: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_private_network: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certfile: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyfile: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
