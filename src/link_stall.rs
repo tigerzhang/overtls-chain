@@ -145,6 +145,7 @@ impl LinkHealth {
             self.watch.clear();
             self.ping_sent_at = None;
             self.last_ping = Some(now);
+            crate::perf::note_stall();
             return LinkCheck::Reset(reason);
         }
 

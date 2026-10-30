@@ -17,3 +17,4 @@ dev/
 target/
 Cargo.lock
 overtls-chain-client-config.json
+overtls-chain-client-config-us.json

@@ -107,6 +107,26 @@ where
     let session_id = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let session_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    let stats_pool = pool.clone();
+    let stats_incomings = incomings.clone();
+    crate::perf::spawn_reporter(
+        "client",
+        session_count.clone(),
+        move || {
+            let pool = stats_pool.clone();
+            let incomings = stats_incomings.clone();
+            async move {
+                Some(crate::perf::PoolSnapshot {
+                    idle: pool.pool_size().await,
+                    outstanding: pool.outstanding_count(),
+                    max: pool.max_size(),
+                    udp_sources: incomings.lock().await.len(),
+                })
+            }
+        },
+        quit.clone(),
+    );
+
     loop {
         tokio::select! {
             _ = quit.cancelled() => {
@@ -123,17 +143,10 @@ where
                 let peer_addr = conn.peer_addr()?;
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    let mut ws_stream = match pool.get_connection().await.map_err(std::io::Error::other) {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            log::debug!("{peer_addr} failed to acquire WebSocket stream from pool: '{e}'");
-                            return;
-                        }
-                    };
                     let count = session_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     log::debug!("session #{session_id} from {peer_addr} started, session count {count}");
-                    if let Err(e) = handle_incoming::<_, S>(conn, config, Some(udp_tx), incomings, &mut *ws_stream).await {
-                        log::debug!("{e}");
+                    if let Err(e) = handle_incoming(conn, config, Some(udp_tx), incomings, pool).await {
+                        log::debug!("{peer_addr} {e}");
                     }
                     let count = session_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
                     log::debug!("session #{session_id} from {peer_addr} ended, session count {count}");
@@ -145,20 +158,37 @@ where
     Ok(())
 }
 
-async fn handle_incoming<IO, S>(
+const LOCAL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const SLOW_ACQUIRE: std::time::Duration = std::time::Duration::from_millis(200);
+
+async fn handle_incoming<IO, M, S>(
     conn: IncomingConnection<IO>,
     config: Config,
     udp_tx: Option<udprelay::UdpRequestSender>,
     incomings: udprelay::SocketAddrHashSet,
-    ws_stream: &mut WebSocketStream<S>,
+    pool: Arc<ConnectionPool<M>>,
 ) -> Result<()>
 where
-    S: AsyncReadWrite + Unpin + Send + 'static,
     IO: 'static,
+    M: ConnectionManager<Connection = WebSocketStream<S>> + Send + Sync + 'static,
+    S: AsyncReadWrite + Unpin + Send + 'static,
 {
     let peer_addr = conn.peer_addr()?;
-    let (conn, _res) = conn.authenticate().await?;
-    match conn.wait_request().await? {
+    let (conn, _res) = match tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, conn.authenticate()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            log::warn!("perf {peer_addr} socks authenticate timed out after {LOCAL_HANDSHAKE_TIMEOUT:?}");
+            return Err(Error::from(format!("{peer_addr} socks authenticate timed out")));
+        }
+    };
+    let request = match tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, conn.wait_request()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            log::warn!("perf {peer_addr} socks request timed out after {LOCAL_HANDSHAKE_TIMEOUT:?}");
+            return Err(Error::from(format!("{peer_addr} socks request timed out")));
+        }
+    };
+    match request {
         ClientConnection::UdpAssociate(asso, _) => {
             if let Some(udp_tx) = udp_tx {
                 if let Err(e) = udprelay::handle_s5_upd_associate(asso, udp_tx, incomings, config).await {
@@ -174,8 +204,37 @@ where
             conn.shutdown().await?;
         }
         ClientConnection::Connect(connect, addr) => {
-            if let Err(e) = handle_socks5_cmd_connection::<S>(connect, addr.clone(), config, ws_stream).await {
+            let acquire_started = std::time::Instant::now();
+            let acquired = pool.clone().get_connection().await;
+            let waited = acquire_started.elapsed();
+            crate::perf::note_acquire(waited, acquired.is_ok());
+            if waited >= SLOW_ACQUIRE {
+                log::warn!(
+                    "perf slow pool acquire {waited:?} for {peer_addr} -> {addr}, ok={} outstanding={} idle={} max={}",
+                    acquired.is_ok(),
+                    pool.outstanding_count(),
+                    pool.pool_size().await,
+                    pool.max_size(),
+                );
+            }
+            let mut ws_stream = match acquired {
+                Ok(stream) => stream,
+                Err(e) => {
+                    log::warn!("perf pool acquire failed for {peer_addr} -> {addr}: {e}");
+                    let mut failed = connect.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+                    let _ = failed.shutdown().await;
+                    return Ok(());
+                }
+            };
+            if let Err(e) = handle_socks5_cmd_connection::<S>(connect, addr.clone(), config, &mut *ws_stream).await {
                 log::debug!("{peer_addr} <> {addr} {e}");
+                // A failed upstream must not go back into the pool. Ping-based validation used to
+                // reject it, but that ping ran while the pool mutex was held and stalled every checkout.
+                if is_upstream_failure(&e) {
+                    log::warn!("perf discard upstream link {peer_addr} <> {addr}: {e}");
+                    crate::perf::note_pool_drop();
+                    let _dead = ws_stream.into_inner();
+                }
             }
         }
     }
@@ -247,7 +306,11 @@ where
                 buf.clear();
             }
             result = ws_stream.next() => {
-                let msg = result.ok_or("message not exist")??;
+                let msg = match result {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => return Err(err.into()),
+                    None => return Err(Error::from("upstream: websocket closed")),
+                };
                 link_health.on_inbound();
 
                 if let Err(e) = crate::traffic_status::traffic_status_update(0, msg.len()) {
@@ -260,8 +323,8 @@ where
                         log::trace!("{src} <- {dst} length {}", data.len());
                     }
                     Message::Close(_) => {
-                        log::debug!("{src} <- {dst} ws closed, exiting...");
-                        break;
+                        log::debug!("perf {src} <- {dst} websocket closed, discarding link");
+                        return Err(Error::from("upstream: websocket close"));
                     }
                     Message::Text(data) => {
                         let msg_str = data.as_str();
@@ -293,12 +356,16 @@ where
                 let stats = ws_stream.get_ref().tcp_link_stats();
                 match link_health.poll(stats) {
                     crate::link_stall::LinkCheck::Reset(reason) => {
-                        log::warn!("{src} <> {dst} upstream link stalled ({reason}), resetting");
+                        log::warn!("perf {src} <> {dst} upstream link stalled ({reason}), resetting");
                         let _ = ws_stream.close(None).await;
-                        return Err(Error::from(format!("upstream link stalled ({reason})")));
+                        return Err(Error::from(format!("upstream: link stalled ({reason})")));
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: true } => {
-                        ws_stream.send(Message::Ping(vec![].into())).await?;
+                        if let Err(e) = send_keepalive_ping(ws_stream).await {
+                            log::warn!("perf {src} <> {dst} {e}, resetting");
+                            let _ = ws_stream.close(None).await;
+                            return Err(e);
+                        }
                         log::trace!("{src} -> {dst} Websocket ping from local");
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
@@ -453,17 +520,29 @@ pub trait AsyncReadWrite: AsyncRead + AsyncWrite {
     fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
         None
     }
+
+    fn inactive_reason(&self) -> Option<String> {
+        None
+    }
 }
 
 impl AsyncReadWrite for TcpStream {
     fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
         crate::link_stall::tcp_stats_of_stream(self)
     }
+
+    fn inactive_reason(&self) -> Option<String> {
+        crate::tcp_stream::inactive_reason(self)
+    }
 }
 
 impl AsyncReadWrite for TlsStream<TcpStream> {
     fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
         crate::link_stall::tcp_stats_of_stream(self.get_ref().0)
+    }
+
+    fn inactive_reason(&self) -> Option<String> {
+        crate::tcp_stream::inactive_reason(self.get_ref().0)
     }
 }
 
@@ -474,6 +553,10 @@ where
     fn tcp_link_stats(&self) -> Option<crate::link_stall::TcpLinkStats> {
         (**self).tcp_link_stats()
     }
+
+    fn inactive_reason(&self) -> Option<String> {
+        (**self).inactive_reason()
+    }
 }
 
 type BoxStream = Box<dyn AsyncReadWrite + Unpin + Send>;
@@ -483,7 +566,41 @@ use connection_pool::{ConnectionManager, ConnectionPool};
 use std::future::Future;
 use std::pin::Pin;
 
-const VALID_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const PING_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ping the upstream, but do not wait forever. A collapsed send window makes `send` park until
+/// the buffer drains, which also stops the link check that is supposed to reset that socket.
+pub(crate) async fn send_keepalive_ping<S>(stream: &mut WebSocketStream<S>) -> Result<()>
+where
+    S: AsyncReadWrite + Unpin,
+{
+    match tokio::time::timeout(PING_SEND_TIMEOUT, stream.send(Message::Ping(vec![].into()))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            crate::perf::note_stall();
+            Err(Error::from(format!("upstream: ping failed: {e}")))
+        }
+        Err(_) => {
+            crate::perf::note_stall();
+            let stats = stream
+                .get_ref()
+                .tcp_link_stats()
+                .map(|stats| stats.to_string())
+                .unwrap_or_else(|| "tcp stats unavailable".to_string());
+            Err(Error::from(format!(
+                "upstream: ping send blocked for {PING_SEND_TIMEOUT:?} ({stats})"
+            )))
+        }
+    }
+}
+
+fn is_upstream_failure(err: &Error) -> bool {
+    match err {
+        Error::Tungstenite(_) => true,
+        Error::String(msg) => msg.starts_with("upstream:"),
+        _ => false,
+    }
+}
 
 #[derive(Clone)]
 pub struct WsPlainConnectionManager {
@@ -510,7 +627,7 @@ impl ConnectionManager for WsPlainConnectionManager {
     }
 
     fn is_valid<'a>(&'a self, stream: &'a mut Self::Connection) -> Self::ValidFut<'a> {
-        Box::pin(async move { ws_link_is_usable(stream).await })
+        Box::pin(async move { ws_link_is_usable(stream) })
     }
 }
 
@@ -539,25 +656,23 @@ impl ConnectionManager for WsTlsConnectionManager {
     }
 
     fn is_valid<'a>(&'a self, stream: &'a mut Self::Connection) -> Self::ValidFut<'a> {
-        Box::pin(async move { ws_link_is_usable(stream).await })
+        Box::pin(async move { ws_link_is_usable(stream) })
     }
 }
 
-async fn ws_link_is_usable<S>(stream: &mut WebSocketStream<S>) -> bool
+fn ws_link_is_usable<S>(stream: &WebSocketStream<S>) -> bool
 where
     S: AsyncReadWrite + Unpin,
 {
-    if let Some(stats) = stream.get_ref().tcp_link_stats()
-        && stats.is_stalled()
-    {
-        log::warn!("upstream link stalled ({stats}), dropping it so a new one is opened");
+    // Checkout and the pool's background cleanup both call this while holding the pool mutex.
+    // A ping here blocks every other request for the round trip, which is how a few slow
+    // upstreams made the whole proxy slower the longer it ran.
+    if let Some(reason) = stream.get_ref().inactive_reason() {
+        log::warn!("perf drop pooled link ({reason})");
+        crate::perf::note_pool_drop();
         return false;
     }
-    let r = tokio::time::timeout(VALID_TEST_TIMEOUT, stream.send(Message::Ping(vec![].into()))).await;
-    if !matches!(r, Ok(Ok(_))) {
-        return false;
-    }
-    matches!(tokio::time::timeout(VALID_TEST_TIMEOUT, stream.next()).await, Ok(Some(_)))
+    true
 }
 
 #[cfg(test)]

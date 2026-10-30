@@ -93,6 +93,7 @@ pub async fn run_server(config: &Config, exiting_flag: crate::CancellationToken)
 
     let session_id = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let session_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::perf::spawn_reporter("server", session_count.clone(), || std::future::ready(None), exiting_flag.clone());
 
     loop {
         tokio::select! {
@@ -102,13 +103,20 @@ pub async fn run_server(config: &Config, exiting_flag: crate::CancellationToken)
             }
             ret = listener.accept() => {
                 let (stream, peer_addr) = ret?;
+                crate::tcp_stream::tune(&stream);
                 let acceptor = acceptor.clone();
                 let config = config.clone();
                 let traffic_audit = traffic_audit.clone();
 
                 let incoming_task = async move {
                     if let Some(acceptor) = acceptor {
-                        let stream = acceptor.accept(stream).await?;
+                        let stream = match tokio::time::timeout(std::time::Duration::from_secs(15), acceptor.accept(stream)).await {
+                            Ok(res) => res?,
+                            Err(_) => {
+                                log::warn!("perf {peer_addr} tls handshake timed out");
+                                return Err(Error::from(format!("{peer_addr} tls handshake timed out")));
+                            }
+                        };
                         handle_incoming(stream, peer_addr, config, traffic_audit).await?;
                     } else {
                         handle_incoming(stream, peer_addr, config, traffic_audit).await?;
@@ -140,7 +148,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut buf = BytesMut::with_capacity(2048);
-    let size = stream.read_buf(&mut buf).await?;
+    let size = match tokio::time::timeout(std::time::Duration::from_secs(15), stream.read_buf(&mut buf)).await {
+        Ok(res) => res?,
+        Err(_) => {
+            log::warn!("perf {peer} client handshake timed out");
+            return Err(Error::from(format!("{peer} client handshake timed out")));
+        }
+    };
     if size == 0 {
         return Err(Error::from("empty request"));
     }
@@ -639,7 +653,7 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 let stats = outgoing.as_ref().and_then(|stream| stream.get_ref().tcp_link_stats());
                 match link_health.poll(stats) {
                     crate::link_stall::LinkCheck::Reset(reason) => {
-                        log::warn!("{peer} chain upstream link stalled ({reason}), resetting");
+                        log::warn!("perf {peer} chain upstream link stalled ({reason}), resetting");
                         if let Err(e) = replace_chain_link(&mut outgoing, &chain, false).await {
                             log::error!("{peer} failed to reset chain link: {e}");
                         }
@@ -652,9 +666,9 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: true } => {
                         if let Some(stream) = &mut outgoing
-                            && let Err(e) = stream.send(Message::Ping(vec![].into())).await
+                            && let Err(e) = client::send_keepalive_ping(stream).await
                         {
-                            log::warn!("{peer} chain upstream ping failed ({e}), resetting");
+                            log::warn!("perf {peer} chain upstream {e}, resetting");
                             if let Err(err) = replace_chain_link(&mut outgoing, &chain, false).await {
                                 log::error!("{peer} failed to reset chain link: {err}");
                             }
@@ -771,16 +785,16 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 let stats = outgoing.as_ref().and_then(|stream| stream.get_ref().tcp_link_stats());
                 match link_health.poll(stats) {
                     crate::link_stall::LinkCheck::Reset(reason) => {
-                        log::warn!("[UDP] chain upstream link stalled ({reason}), resetting");
+                        log::warn!("perf [UDP] chain upstream link stalled ({reason}), resetting");
                         if let Err(e) = replace_chain_link(&mut outgoing, &chain, true).await {
                             return Err(e);
                         }
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: true } => {
                         if let Some(stream) = &mut outgoing
-                            && let Err(e) = stream.send(Message::Ping(vec![].into())).await
+                            && let Err(e) = client::send_keepalive_ping(stream).await
                         {
-                            log::warn!("[UDP] chain upstream ping failed ({e}), resetting");
+                            log::warn!("perf [UDP] chain upstream {e}, resetting");
                             replace_chain_link(&mut outgoing, &chain, true).await?;
                         }
                     }
@@ -876,7 +890,14 @@ async fn svr_send_udp_packet_to_dst(
     let (dst_addr, src_addr, pkt) = crate::udprelay::decode_udp_packet(&mut buf)?;
     log::trace!("[UDP] {src_addr} -> {dst_addr} length {}", pkt.len());
 
-    dst_src_pairs.lock().await.insert(dst_addr.clone(), src_addr.clone());
+    const MAX_UDP_PAIRS: usize = 4096;
+    let mut pairs = dst_src_pairs.lock().await;
+    if pairs.len() >= MAX_UDP_PAIRS && !pairs.contains_key(&dst_addr) {
+        log::warn!("perf udp destination map reached {MAX_UDP_PAIRS}, clearing");
+        pairs.clear();
+    }
+    pairs.insert(dst_addr.clone(), src_addr.clone());
+    drop(pairs);
 
     // select the IPv4 destination address first if available, otherwise use the IPv6 address
     let mut ipv4_addr = None;

@@ -62,6 +62,7 @@ pub(crate) async fn handle_s5_upd_associate(
             let udp_rx = udp_tx.subscribe();
 
             let incoming_addr = Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], 0))));
+            let seen_sources: SocketAddrHashSet = Arc::new(Mutex::new(HashSet::new()));
 
             let timeout_secs = Duration::from_secs(10); // TODO: configurable
             let runtime = runtime::Tokio::new();
@@ -70,7 +71,7 @@ pub(crate) async fn handle_s5_upd_associate(
             let res = tokio::select! {
                 _ = timeout.wait() => Ok::<_, Error>(()),
                 res = reply_listener.wait_until_closed() => res.map_err(|e| e.into()),
-                res = socks5_to_relay(listen_udp.clone(), incoming_addr.clone(), incomings.clone(), udp_tx, &timeout) => res,
+                res = socks5_to_relay(listen_udp.clone(), incoming_addr.clone(), incomings.clone(), seen_sources.clone(), udp_tx, &timeout) => res,
                 res = relay_to_socks5(listen_udp, incoming_addr.clone(), udp_rx, &timeout) => res,
             };
 
@@ -79,8 +80,11 @@ pub(crate) async fn handle_s5_upd_associate(
             log::trace!("[UDP] {listen_addr} listener closed with {res:?}");
 
             {
-                let incoming = *incoming_addr.lock().await;
-                incomings.lock().await.remove(&incoming);
+                let seen = seen_sources.lock().await;
+                let mut all = incomings.lock().await;
+                for addr in seen.iter() {
+                    all.remove(addr);
+                }
             }
 
             res
@@ -104,6 +108,7 @@ async fn socks5_to_relay(
     listen_udp: Arc<AssociatedUdpSocket>,
     incoming: Arc<Mutex<SocketAddr>>,
     incomings: SocketAddrHashSet,
+    seen_sources: SocketAddrHashSet,
     udp_tx: UdpRequestSender,
     timeout: &Timeout<runtime::Tokio>,
 ) -> Result<()> {
@@ -120,6 +125,7 @@ async fn socks5_to_relay(
         }
 
         incoming.lock().await.clone_from(&src_addr);
+        seen_sources.lock().await.insert(src_addr);
         incomings.lock().await.insert(src_addr);
 
         // log::trace!("[UDP] {src_addr} -> {dst_addr} incoming packet size {}", pkt.len());
@@ -283,13 +289,18 @@ where
                 let stats = ws_stream.get_ref().tcp_link_stats();
                 match link_health.poll(stats) {
                     crate::link_stall::LinkCheck::Reset(reason) => {
-                        log::warn!("[UDP] upstream link stalled ({reason}), resetting");
+                        log::warn!("perf [UDP] upstream link stalled ({reason}), resetting");
                         let _ = ws_stream.close(None).await;
-                        res = Err(Error::from(format!("upstream link stalled ({reason})")));
+                        res = Err(Error::from(format!("upstream: link stalled ({reason})")));
                         break;
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: true } => {
-                        ws_stream.send(Message::Ping(vec![].into())).await?;
+                        if let Err(e) = client::send_keepalive_ping(&mut ws_stream).await {
+                            log::warn!("perf [UDP] {e}, resetting");
+                            let _ = ws_stream.close(None).await;
+                            res = Err(e);
+                            break;
+                        }
                         log::trace!("[UDP] Websocket ping from local");
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
