@@ -113,6 +113,12 @@ fn main() -> Result<(), BoxError> {
         client.pool_max_size = Some(size);
     }
 
+    if let Some(seconds) = opt.http_session_timeout
+        && let Some(client) = config.client.as_mut()
+    {
+        client.http_session_timeout = Some(seconds);
+    }
+
     if opt.generate_url {
         let url = config.generate_ssr_url()?;
         println!("{url}");

@@ -8,6 +8,11 @@ use std::{
 pub(crate) const TEST_TIMEOUT_SECS: u64 = 10;
 pub(crate) const DEFAULT_POOL_MAX_SIZE: usize = 50;
 pub(crate) const MIN_MAX_LIFETIME_SECS: u64 = 10 * 60;
+/// TCP + TLS + WebSocket setup toward the next chain hop.
+/// A recoverable A→B success in the timeout report took about 35s. The client
+/// HTTP confirmation timeout on that path is 60s, so this bound stays under it
+/// and is a different setting from `Client::http_session_timeout`.
+pub(crate) const DEFAULT_CHAIN_UPSTREAM_SETUP_SECS: u64 = 45;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct Config {
@@ -137,8 +142,23 @@ pub struct Chain {
     pub dangerous_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tunnel_path: Option<TunnelPath>,
+    /// Seconds for TCP connect, TLS, and WebSocket setup to the upstream hop.
+    /// `None` uses [`DEFAULT_CHAIN_UPSTREAM_SETUP_SECS`]. This is not the client
+    /// HTTP session confirmation timeout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_setup_timeout_secs: Option<u64>,
     #[serde(skip)]
     pub server_ip_addr: Option<SocketAddr>,
+}
+
+impl Chain {
+    pub(crate) fn upstream_setup_timeout(&self) -> std::time::Duration {
+        let secs = match self.upstream_setup_timeout_secs {
+            Some(secs) if secs > 0 => secs,
+            _ => DEFAULT_CHAIN_UPSTREAM_SETUP_SECS,
+        };
+        std::time::Duration::from_secs(secs)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -181,6 +201,9 @@ pub struct Client {
     server_ip_addr: Option<SocketAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_max_size: Option<usize>,
+    /// Seconds to wait for the remote HTTP proxy session confirmation; defaults to 15.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_session_timeout: Option<u64>,
 }
 
 impl PartialEq for Client {
@@ -458,6 +481,9 @@ impl Config {
                 if let Some(tunnel_path) = &mut chain.tunnel_path {
                     tunnel_path.standardize();
                 }
+                if chain.upstream_setup_timeout_secs == Some(0) {
+                    return Err(Error::from("upstream_setup_timeout_secs must be greater than zero"));
+                }
 
                 let mut addr = (chain_host.clone(), chain.server_port).to_socket_addrs()?;
                 let addr = addr.next().ok_or("upstream chain address not available")?;
@@ -491,6 +517,9 @@ impl Config {
             }
 
             if !self.is_server {
+                if client.http_session_timeout == Some(0) {
+                    return Err(Error::from("http_session_timeout must be greater than zero"));
+                }
                 if let Some(max_lifetime) = client.max_lifetime
                     && max_lifetime < MIN_MAX_LIFETIME_SECS
                 {
@@ -725,4 +754,10 @@ fn test_chain_config_validation() {
     assert!(chain.server_ip_addr.is_some());
     assert_eq!(chain.server_port, local_port);
     assert_eq!(chain.tunnel_path.as_ref().unwrap().extract(), vec!["/b-tunnel/"]);
+    assert_eq!(chain.upstream_setup_timeout().as_secs(), DEFAULT_CHAIN_UPSTREAM_SETUP_SECS);
+    assert!(chain.upstream_setup_timeout().as_secs() > 35);
+    assert!(chain.upstream_setup_timeout().as_secs() < 60);
+
+    config.server.as_mut().unwrap().chain.as_mut().unwrap().upstream_setup_timeout_secs = Some(0);
+    assert!(config.check_correctness(true).is_err());
 }

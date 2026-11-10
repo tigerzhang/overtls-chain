@@ -13,6 +13,8 @@ overtls 是 [SOCKS5](https://en.wikipedia.org/wiki/SOCKS#SOCKS5) 型代理軟件
 > ```
 > 這段代碼翻譯成 人話 就是：如果 `oT` 啟用了，而且 `加密方式`爲 `none`、`混淆`爲 `plain`、`協議`爲 `origin`，那麼就是 `OverTLS` 啦。
 
+HTTP 代理客户端可通过 `--http-session-timeout 60` 将远端会话确认的等待时间设为 60 秒（默认 15 秒）。该参数覆盖 JSON 配置中的 `client_settings.http_session_timeout`，必须大于 0，且不能与 `--c-api` 同时使用。
+
 ## 原理
 
 爲了能有效騙過 [GFW](https://en.wikipedia.org/wiki/Great_Firewall)，直接使用 [TLS](https://en.wikipedia.org/wiki/Transport_Layer_Security) 作爲代理協議是最簡單的方法。

@@ -121,6 +121,10 @@ pub struct CmdOpt {
     #[arg(long)]
     pub c_api: bool,
 
+    /// HTTP proxy session confirmation timeout in seconds (default: 15).
+    #[arg(long, value_name = "seconds", value_parser = clap::value_parser!(u64).range(1..), conflicts_with = "c_api")]
+    pub http_session_timeout: Option<u64>,
+
     /// Connection pool max size
     #[arg(short, long, value_name = "size")]
     pub pool_max_size: Option<usize>,
@@ -154,6 +158,9 @@ impl CmdOpt {
             if args.advertise_ip.is_some() {
                 output_error_and_exit("Advertise IP is not supported for server");
             }
+            if args.http_session_timeout.is_some() {
+                output_error_and_exit("HTTP session timeout is not supported for server");
+            }
             if args.max_lifetime.is_some() {
                 output_error_and_exit("Max lifetime is not supported for server");
             }
@@ -180,4 +187,19 @@ pub(crate) const fn version_info() -> &'static str {
 
 fn about_info() -> String {
     format!("Proxy tunnel over tls.\nVersion {}", version_info())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_http_session_timeout() {
+        let args = CmdOpt::try_parse_from(["overtls-bin", "--http-session-timeout", "60"]).unwrap();
+        assert_eq!(args.http_session_timeout, Some(60));
+        assert_eq!(CmdOpt::try_parse_from(["overtls-bin"]).unwrap().http_session_timeout, None);
+        assert!(CmdOpt::try_parse_from(["overtls-bin", "--http-session-timeout", "0"]).is_err());
+        assert!(CmdOpt::try_parse_from(["overtls-bin", "--http-session-timeout", "60", "--c-api"]).is_err());
+    }
 }

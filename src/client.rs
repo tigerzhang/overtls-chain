@@ -163,11 +163,11 @@ where
 const LOCAL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SLOW_ACQUIRE: std::time::Duration = std::time::Duration::from_millis(200);
 
-async fn wait_http_session<S>(stream: &mut WebSocketStream<S>) -> std::io::Result<()>
+async fn wait_http_session<S>(stream: &mut WebSocketStream<S>, timeout: std::time::Duration) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         while let Some(message) = stream.next().await {
             match message.map_err(std::io::Error::other)? {
                 Message::Text(text) if text.as_str() == START_SESSION => return Ok(()),
@@ -178,7 +178,12 @@ where
         Err(std::io::Error::other("remote HTTP proxy connection failed"))
     })
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP proxy session timed out"))?
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("HTTP proxy session timed out after {timeout:?}"),
+        )
+    })?
 }
 
 /// HTTP tunnels are not recycled, and must not inherit an unfinished SOCKS session.
@@ -240,16 +245,25 @@ where
             // SOCKS sessions can leave unread data/EOF messages on recycled WebSockets.
             // HTTP already closes its link after use, so establish a fresh one rather than
             // interpreting a previous SOCKS session's messages as this request's result.
+            let upstream_started = std::time::Instant::now();
             let mut ws = create_http_ws_stream(&config).await.map_err(|e| {
                 log::warn!("{src} HTTP upstream connection failed for {dst}: {e}");
                 e
             })?;
+            log::debug!(
+                "{src} HTTP upstream WebSocket ready for {dst} after {:?}",
+                upstream_started.elapsed()
+            );
+            let session_started = std::time::Instant::now();
             let command = format!("{START_SESSION}:{}", addess_to_b64str(&dst, false));
             ws.send(Message::Text(command.into())).await.map_err(std::io::Error::other)?;
-            wait_http_session(&mut ws).await.map_err(|e| {
+            let timeout =
+                std::time::Duration::from_secs(config.client.as_ref().and_then(|client| client.http_session_timeout).unwrap_or(15));
+            wait_http_session(&mut ws, timeout).await.map_err(|e| {
                 log::warn!("{src} HTTP session failed for {dst}: {e}");
                 e
             })?;
+            log::debug!("{src} HTTP session confirmed for {dst} after {:?}", session_started.elapsed());
             let (local, tunnel) = tokio::io::duplex(crate::STREAM_BUFFER_SIZE);
             tokio::spawn(async move {
                 if let Err(e) = client_traffic_loop(tunnel, &mut ws, src, dst, true).await {
@@ -941,6 +955,201 @@ mod tests {
         b_server.await.unwrap()?;
         Ok(())
     }
+
+    fn chain_to(addr: SocketAddr, setup_secs: u64) -> crate::config::Chain {
+        crate::config::Chain {
+            disable_tls: Some(true),
+            client_id: Some("proxy-a".to_string()),
+            server_host: "127.0.0.1".to_string(),
+            server_port: addr.port(),
+            server_domain: Some("127.0.0.1".to_string()),
+            server_ip_addr: Some(addr),
+            tunnel_path: Some(crate::config::TunnelPath::Single("/b-tunnel/".to_string())),
+            upstream_setup_timeout_secs: Some(setup_secs),
+            ..Default::default()
+        }
+    }
+
+    fn tunnel_config(http_session_timeout: u64) -> crate::config::Config {
+        crate::config::Config::from_json_str(&format!(
+            r#"{{
+                "tunnel_path": "/tunnel/",
+                "client_settings": {{
+                    "server_host": "127.0.0.1",
+                    "server_port": 1,
+                    "listen_host": "127.0.0.1",
+                    "listen_port": 0,
+                    "http_session_timeout": {http_session_timeout}
+                }}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// Peer accepts TCP and then never finishes the WebSocket handshake.
+    /// The oneshot fires with the accept time. The task returns the EOF time.
+    async fn spawn_stalled_peer() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<std::time::Instant>,
+        tokio::task::JoinHandle<std::time::Instant>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let opened = std::time::Instant::now();
+            let _ = accepted_tx.send(opened);
+            let mut buf = Vec::new();
+            let _ = socket.read_to_end(&mut buf).await;
+            std::time::Instant::now()
+        });
+        (addr, accepted_rx, peer)
+    }
+
+    async fn spawn_chain_tunnel(
+        chain: crate::config::Chain,
+        http_session_timeout: u64,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let a_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let ws = accept_async(socket).await?;
+            let traffic_audit = Arc::new(Mutex::new(crate::traffic_audit::TrafficAudit::new()));
+            crate::server::svr_chain_tunnel(ws, a_addr, tunnel_config(http_session_timeout), traffic_audit, &None, None, chain).await
+        });
+        (a_addr, server)
+    }
+
+    #[tokio::test]
+    async fn chain_setup_errors_on_stalled_handshake_within_upstream_deadline() -> Result<()> {
+        let upstream_secs = 2u64;
+        let http_secs = 8u64;
+        assert_ne!(upstream_secs, http_secs, "the two timeouts must be different values");
+        let upstream = std::time::Duration::from_secs(upstream_secs);
+        let http_timeout = std::time::Duration::from_secs(http_secs);
+
+        let (b_addr, accepted, peer) = spawn_stalled_peer().await;
+        let chain = chain_to(b_addr, upstream_secs);
+        assert_eq!(chain.upstream_setup_timeout(), upstream);
+        assert_ne!(chain.upstream_setup_timeout(), http_timeout);
+
+        let (a_addr, a_server) = spawn_chain_tunnel(chain, http_secs).await;
+        let (mut client_ws, _) = connect_async(format!("ws://127.0.0.1:{}/tunnel/", a_addr.port())).await?;
+        let target = Address::from(("127.0.0.1", 80));
+        let start_msg = format!("{}:{}", START_SESSION, addess_to_b64str(&target, false));
+        let started = std::time::Instant::now();
+        client_ws.send(Message::Text(start_msg.into())).await?;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), client_ws.next())
+            .await
+            .expect("stalled handshake must fail before the 10s harness cap and well under 35s")
+            .ok_or("downstream closed before setup failed")??;
+        let elapsed = started.elapsed();
+        assert!(matches!(msg, Message::Text(ref text) if text.as_str() == END_SESSION), "{msg:?}");
+        assert!(elapsed < std::time::Duration::from_secs(35), "error-before-35s elapsed={elapsed:?}");
+        assert!(
+            elapsed < http_timeout,
+            "setup followed the HTTP confirmation timeout: {elapsed:?} vs {http_timeout:?}"
+        );
+        assert!(elapsed + std::time::Duration::from_millis(200) < http_timeout);
+        assert!(
+            elapsed < upstream + std::time::Duration::from_secs(3),
+            "elapsed {elapsed:?} exceeded upstream deadline {upstream:?}"
+        );
+        assert!(
+            elapsed + std::time::Duration::from_millis(700) >= upstream,
+            "elapsed {elapsed:?} did not wait for upstream deadline {upstream:?}"
+        );
+
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(2), peer)
+            .await
+            .expect("upstream socket still open after the setup deadline")
+            .unwrap();
+        let opened = accepted.await.expect("stalled peer never accepted");
+        let peer_held = eof.saturating_duration_since(opened);
+        assert!(
+            peer_held < std::time::Duration::from_secs(35),
+            "error-before-35s peer_held={peer_held:?}"
+        );
+        assert!(
+            peer_held < http_timeout,
+            "upstream socket stayed open for the HTTP confirmation timeout"
+        );
+        assert!(peer_held < upstream + std::time::Duration::from_secs(3));
+        println!(
+            "observation error-before-35s elapsed_ms={} peer_held_ms={} upstream_deadline_s={} http_session_timeout_s={} outcome=END_SESSION",
+            elapsed.as_millis(),
+            peer_held.as_millis(),
+            upstream_secs,
+            http_secs
+        );
+
+        drop(client_ws);
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), a_server)
+            .await
+            .expect("chain tunnel did not exit after downstream close");
+        let _ = finished.expect("chain tunnel task panicked");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_setup_stops_when_downstream_session_ends() -> Result<()> {
+        let upstream_secs = 8u64;
+        let http_secs = 15u64;
+        assert_ne!(upstream_secs, http_secs, "the two timeouts must be different values");
+        let upstream = std::time::Duration::from_secs(upstream_secs);
+        let http_timeout = std::time::Duration::from_secs(http_secs);
+
+        let (b_addr, accepted, peer) = spawn_stalled_peer().await;
+        let chain = chain_to(b_addr, upstream_secs);
+        assert_eq!(chain.upstream_setup_timeout(), upstream);
+        assert!(http_timeout > upstream, "HTTP confirmation timeout is the longer one");
+
+        let (a_addr, a_server) = spawn_chain_tunnel(chain, http_secs).await;
+        let (mut client_ws, _) = connect_async(format!("ws://127.0.0.1:{}/tunnel/", a_addr.port())).await?;
+        let target = Address::from(("127.0.0.1", 80));
+        let start_msg = format!("{}:{}", START_SESSION, addess_to_b64str(&target, false));
+        client_ws.send(Message::Text(start_msg.into())).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted)
+            .await
+            .expect("stalled peer did not accept")
+            .unwrap();
+
+        let closed = std::time::Instant::now();
+        drop(client_ws);
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(3), peer)
+            .await
+            .expect("cancel-before-HTTP-timeout: upstream socket stayed open")
+            .unwrap();
+        assert!(eof >= closed, "upstream socket closed before the downstream session ended");
+        let close_to_eof = eof.saturating_duration_since(closed);
+        assert!(
+            close_to_eof < std::time::Duration::from_secs(2),
+            "cancel-before-HTTP-timeout close_to_eof={close_to_eof:?} upstream={upstream:?} http={http_timeout:?}"
+        );
+        assert!(
+            close_to_eof < http_timeout,
+            "upstream attempt waited out the HTTP confirmation timeout"
+        );
+        assert!(
+            close_to_eof + std::time::Duration::from_secs(2) < upstream,
+            "upstream attempt waited out its own deadline"
+        );
+        println!(
+            "observation cancel-before-HTTP-timeout close_to_eof_us={} upstream_deadline_s={} http_session_timeout_s={}",
+            close_to_eof.as_micros(),
+            upstream_secs,
+            http_secs
+        );
+
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(3), a_server)
+            .await
+            .expect("chain tunnel kept running after the downstream session ended");
+        let _ = finished.expect("chain tunnel task panicked");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1201,13 +1410,25 @@ mod http_proxy_tests {
     }
 
     #[tokio::test]
+    async fn http_session_uses_configured_timeout() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), wait_http_session(&mut client, Duration::from_millis(10)))
+            .await
+            .expect("configured timeout must expire before the default 15 seconds")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("10ms"));
+    }
+
+    #[tokio::test]
     async fn rejects_failed_remote_session() {
         let (client, server) = tokio::io::duplex(4096);
         let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
         let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
         server.send(Message::Text(START_SESSION.into())).await.unwrap();
-        wait_http_session(&mut client).await.unwrap();
+        wait_http_session(&mut client, LOCAL_HANDSHAKE_TIMEOUT).await.unwrap();
         server.send(Message::Text(END_SESSION.into())).await.unwrap();
-        assert!(wait_http_session(&mut client).await.is_err());
+        assert!(wait_http_session(&mut client, LOCAL_HANDSHAKE_TIMEOUT).await.is_err());
     }
 }

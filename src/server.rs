@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use socks5_impl::Address;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::Arc,
 };
@@ -35,6 +35,7 @@ pub(crate) const REMOTE_EOF: &str = "Remote EOF";
 
 const WS_HANDSHAKE_LEN: usize = 1024;
 const WS_MSG_HEADER_LEN: usize = 14;
+const UDP_CHAIN_SETUP_QUEUE: usize = 32;
 
 pub async fn run_server(config: &Config, exiting_flag: crate::CancellationToken) -> Result<()> {
     crate::ensure_rustls_crypto_provider()?;
@@ -486,6 +487,70 @@ async fn svr_normal_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// TCP, TLS, and WebSocket setup to the next chain hop.
+///
+/// The `JoinHandle` is aborted on drop, which drops `create_chain_ws_stream`
+/// and the `TcpStream` it owns. The deadline runs on this task, so it still
+/// fires if the tunnel loop is awaiting something else.
+struct ChainSetup {
+    handle: Option<tokio::task::JoinHandle<Result<client::WsBoxStream>>>,
+}
+
+impl ChainSetup {
+    /// Abort setup and wait until the in-progress socket is dropped.
+    async fn cancel(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for ChainSetup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn begin_chain_setup(chain: &crate::config::Chain, udp: bool, label: &str) -> ChainSetup {
+    let deadline = chain.upstream_setup_timeout();
+    log::info!("{label} chain upstream setup started, deadline {}s", deadline.as_secs());
+    let chain = chain.clone();
+    let handle = tokio::spawn(async move {
+        let udp_tunnel = if udp { Some(true) } else { None };
+        match tokio::time::timeout(deadline, client::create_chain_ws_stream(&chain, None, udp_tunnel)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::from(format!("upstream: chain setup deadline {}s", deadline.as_secs()))),
+        }
+    });
+    ChainSetup { handle: Some(handle) }
+}
+
+async fn wait_chain_setup(pending: &mut Option<ChainSetup>) -> Result<client::WsBoxStream> {
+    let setup = pending.as_mut().ok_or("upstream: chain setup missing")?;
+    let handle = setup.handle.as_mut().ok_or("upstream: chain setup missing")?;
+    match handle.await {
+        Ok(result) => result,
+        Err(err) => Err(Error::from(format!("upstream: chain setup task ended: {err}"))),
+    }
+}
+
+async fn cancel_pending(pending: &mut Option<ChainSetup>) {
+    if let Some(setup) = pending.take() {
+        setup.cancel().await;
+    }
+}
+
+async fn close_chain_link(outgoing: &mut Option<client::WsBoxStream>) {
+    if let Some(mut old) = outgoing.take() {
+        // A stalled socket must not hold shutdown open. Established links still
+        // get a WebSocket close so the peer does not see a bare reset.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), old.close(None)).await;
+    }
+}
+
 pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     mut ws_stream: WebSocketStream<S>,
     peer: SocketAddr,
@@ -500,30 +565,31 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     let mut link_health = crate::link_stall::LinkHealth::new();
     let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
     link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline_secs = chain.upstream_setup_timeout().as_secs();
+    log::info!("{peer} chain upstream setup deadline is {deadline_secs}s");
 
-    if let Some(target_address) = dst_addr.clone() {
-        match client::create_chain_ws_stream(&chain, None, None).await {
-            Ok(mut stream) => {
-                let msg = Message::Text(format!("{}:{}", START_SESSION, addess_to_b64str(&target_address, false)).into());
-                stream.send(msg).await?;
-                outgoing = Some(stream);
-            }
-            Err(e) => {
-                log::error!("{peer} failed to create chain session to upstream: {e}");
-                let msg = Message::Text(END_SESSION.into());
-                svr_send_ws_message(&mut ws_stream, msg, &traffic_audit, client_id).await?;
-                dst_addr = None;
-            }
-        }
+    let mut pending: Option<ChainSetup> = None;
+    let mut queued_target: Option<Address> = None;
+    if dst_addr.is_some() {
+        queued_target = dst_addr.clone();
+        pending = Some(begin_chain_setup(&chain, false, &peer.to_string()));
     }
 
     loop {
         tokio::select! {
+            biased;
             msg = ws_stream.next() => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
-                    Some(Err(err)) => return Err(err.into()),
-                    None => break,
+                    Some(Err(err)) => {
+                        cancel_pending(&mut pending).await;
+                        return Err(err.into());
+                    }
+                    None => {
+                        log::debug!("{peer} <> {dst_addr:?} incoming connection closed");
+                        cancel_pending(&mut pending).await;
+                        break;
+                    }
                 };
                 let len = (msg.len() + WS_MSG_HEADER_LEN) as u64;
                 if let Some(client_id) = &client_id {
@@ -532,6 +598,8 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 match msg {
                     Message::Close(_) => {
                         log::debug!("{peer} <> {dst_addr:?} incoming connection closed normally");
+                        cancel_pending(&mut pending).await;
+                        close_chain_link(&mut outgoing).await;
                         break;
                     }
                     Message::Binary(data) => {
@@ -548,6 +616,8 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                         if let Some(reason) = msg_str.strip_prefix(END_SESSION) {
                             let reason = reason.strip_prefix(':').unwrap_or(reason).trim();
                             log::debug!("{peer} <> {dst_addr:?} ended session with '{END_SESSION}' message with '{reason}'");
+                            queued_target = None;
+                            cancel_pending(&mut pending).await;
                             if let Some(outgoing) = &mut outgoing {
                                 outgoing.send(Message::Text(END_SESSION.into())).await?;
                             }
@@ -555,17 +625,19 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                         } else if let Some(dst_addr_str) = msg_str.strip_prefix(START_SESSION) {
                             let dst_addr_str = dst_addr_str.strip_prefix(':').map(|s| s.trim()).unwrap_or("");
                             let dst_address = b64str_to_address(dst_addr_str, false).unwrap_or(Address::unspecified_v4());
-                            if dst_addr.is_some() {
-                                if let Some(outgoing) = &mut outgoing {
-                                    outgoing.send(Message::Text(END_SESSION.into())).await?;
-                                }
+                            if dst_addr.is_some()
+                                && let Some(outgoing) = &mut outgoing
+                            {
+                                outgoing.send(Message::Text(END_SESSION.into())).await?;
                             }
                             dst_addr = Some(dst_address.clone());
                             if outgoing.is_none() {
-                                outgoing = Some(client::create_chain_ws_stream(&chain, None, None).await?);
-                            }
-                            let msg = Message::Text(format!("{}:{}", START_SESSION, addess_to_b64str(&dst_address, false)).into());
-                            if let Some(outgoing) = &mut outgoing {
+                                queued_target = Some(dst_address);
+                                if pending.is_none() {
+                                    pending = Some(begin_chain_setup(&chain, false, &peer.to_string()));
+                                }
+                            } else if let Some(outgoing) = &mut outgoing {
+                                let msg = Message::Text(format!("{}:{}", START_SESSION, addess_to_b64str(&dst_address, false)).into());
                                 outgoing.send(msg).await?;
                             }
                         } else {
@@ -583,6 +655,52 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
+            joined = async {
+                if pending.is_some() {
+                    Some(wait_chain_setup(&mut pending).await)
+                } else {
+                    futures_util::future::pending::<Option<Result<client::WsBoxStream>>>().await
+                }
+            } => {
+                pending = None;
+                let Some(result) = joined else {
+                    continue;
+                };
+                match result {
+                    Ok(mut stream) => {
+                        if let Some(target) = queued_target.take() {
+                            let text = format!("{}:{}", START_SESSION, addess_to_b64str(&target, false));
+                            if let Err(e) = stream.send(Message::Text(text.into())).await {
+                                log::warn!("{peer} chain upstream setup failed within deadline {deadline_secs}s: {e}");
+                                drop(stream);
+                                dst_addr = None;
+                                if let Err(err) =
+                                    svr_send_ws_message(&mut ws_stream, Message::Text(END_SESSION.into()), &traffic_audit, client_id).await
+                                {
+                                    log::debug!("{peer} failed to report chain setup error: {err}");
+                                    break;
+                                }
+                            } else {
+                                outgoing = Some(stream);
+                            }
+                        } else {
+                            outgoing = Some(stream);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("{peer} chain upstream setup failed within deadline {deadline_secs}s: {e}");
+                        let waiting = queued_target.take().is_some() || dst_addr.is_some();
+                        dst_addr = None;
+                        if waiting
+                            && let Err(err) =
+                                svr_send_ws_message(&mut ws_stream, Message::Text(END_SESSION.into()), &traffic_audit, client_id).await
+                        {
+                            log::debug!("{peer} failed to report chain setup error: {err}");
+                            break;
+                        }
+                    }
+                }
+            }
             msg = async {
                 if let Some(outgoing) = &mut outgoing {
                     outgoing.next().await
@@ -594,15 +712,16 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     Some(Ok(msg)) => msg,
                     Some(Err(err)) => {
                         log::error!("{peer} outgoing chain websocket error: {err}");
-                        if let Some(mut outgoing) = outgoing.take() {
-                            let _ = outgoing.close(None).await;
-                        }
+                        drop(outgoing.take());
+                        cancel_pending(&mut pending).await;
                         break;
                     }
                     None => {
                         if outgoing.is_some() {
                             log::debug!("{peer} outgoing chain websocket closed");
                         }
+                        drop(outgoing.take());
+                        cancel_pending(&mut pending).await;
                         break;
                     }
                 };
@@ -650,13 +769,16 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             _ = link_check.tick() => {
+                if outgoing.is_none() || pending.is_some() {
+                    continue;
+                }
                 let stats = outgoing.as_ref().and_then(|stream| stream.get_ref().tcp_link_stats());
                 match link_health.poll(stats) {
                     crate::link_stall::LinkCheck::Reset(reason) => {
                         log::warn!("perf {peer} chain upstream link stalled ({reason}), resetting");
-                        if let Err(e) = replace_chain_link(&mut outgoing, &chain, false).await {
-                            log::error!("{peer} failed to reset chain link: {e}");
-                        }
+                        outgoing = None;
+                        queued_target = None;
+                        pending = Some(begin_chain_setup(&chain, false, &peer.to_string()));
                         if dst_addr.take().is_some()
                             && let Err(e) = svr_send_ws_message(&mut ws_stream, Message::Text(END_SESSION.into()), &traffic_audit, client_id).await
                         {
@@ -665,13 +787,16 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: true } => {
-                        if let Some(stream) = &mut outgoing
-                            && let Err(e) = client::send_keepalive_ping(stream).await
-                        {
+                        let ping_error = if let Some(stream) = outgoing.as_mut() {
+                            client::send_keepalive_ping(stream).await.err()
+                        } else {
+                            None
+                        };
+                        if let Some(e) = ping_error {
                             log::warn!("perf {peer} chain upstream {e}, resetting");
-                            if let Err(err) = replace_chain_link(&mut outgoing, &chain, false).await {
-                                log::error!("{peer} failed to reset chain link: {err}");
-                            }
+                            outgoing = None;
+                            queued_target = None;
+                            pending = Some(begin_chain_setup(&chain, false, &peer.to_string()));
                             if dst_addr.take().is_some()
                                 && let Err(err) =
                                     svr_send_ws_message(&mut ws_stream, Message::Text(END_SESSION.into()), &traffic_audit, client_id).await
@@ -689,15 +814,6 @@ pub(crate) async fn svr_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn replace_chain_link(outgoing: &mut Option<client::WsBoxStream>, chain: &crate::config::Chain, udp: bool) -> Result<()> {
-    if let Some(mut old) = outgoing.take() {
-        let _ = old.close(None).await;
-    }
-    let udp_tunnel = if udp { Some(true) } else { None };
-    *outgoing = Some(client::create_chain_ws_stream(chain, None, udp_tunnel).await?);
-    Ok(())
-}
-
 pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     mut ws_stream: WebSocketStream<S>,
     _config: Config,
@@ -705,19 +821,29 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     client_id: &Option<String>,
     chain: crate::config::Chain,
 ) -> Result<()> {
+    let deadline_secs = chain.upstream_setup_timeout().as_secs();
+    log::info!("[UDP] chain upstream setup deadline is {deadline_secs}s");
     let mut outgoing: Option<client::WsBoxStream> = None;
-    replace_chain_link(&mut outgoing, &chain, true).await?;
+    let mut pending = Some(begin_chain_setup(&chain, true, "[UDP]"));
+    let mut queued: VecDeque<bytes::Bytes> = VecDeque::new();
     let mut link_health = crate::link_stall::LinkHealth::new();
     let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
     link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            biased;
             msg = ws_stream.next() => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
-                    Some(Err(err)) => return Err(err.into()),
-                    None => break,
+                    Some(Err(err)) => {
+                        cancel_pending(&mut pending).await;
+                        return Err(err.into());
+                    }
+                    None => {
+                        cancel_pending(&mut pending).await;
+                        break;
+                    }
                 };
                 let len = (msg.len() + WS_MSG_HEADER_LEN) as u64;
                 if let Some(client_id) = &client_id {
@@ -726,17 +852,22 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 match msg {
                     Message::Close(_) => {
                         log::trace!("[UDP] incoming client closed");
-                        if let Some(mut outgoing) = outgoing.take() {
-                            let _ = outgoing.close(None).await;
-                        }
+                        cancel_pending(&mut pending).await;
+                        close_chain_link(&mut outgoing).await;
                         break;
                     }
                     Message::Binary(data) => {
-                        if outgoing.is_none() {
-                            replace_chain_link(&mut outgoing, &chain, true).await?;
+                        if let Some(outgoing) = outgoing.as_mut() {
+                            outgoing.send(Message::Binary(data)).await?;
+                        } else {
+                            if queued.len() >= UDP_CHAIN_SETUP_QUEUE {
+                                queued.pop_front();
+                            }
+                            queued.push_back(data);
+                            if pending.is_none() {
+                                pending = Some(begin_chain_setup(&chain, true, "[UDP]"));
+                            }
                         }
-                        let outgoing = outgoing.as_mut().ok_or("udp chain link missing")?;
-                        outgoing.send(Message::Binary(data)).await?;
                     }
                     Message::Ping(_) => {
                         log::trace!("[UDP] received ping from client");
@@ -749,6 +880,34 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
+            joined = async {
+                if pending.is_some() {
+                    Some(wait_chain_setup(&mut pending).await)
+                } else {
+                    futures_util::future::pending::<Option<Result<client::WsBoxStream>>>().await
+                }
+            } => {
+                pending = None;
+                let Some(result) = joined else {
+                    continue;
+                };
+                match result {
+                    Ok(mut stream) => {
+                        while let Some(packet) = queued.pop_front() {
+                            if let Err(e) = stream.send(Message::Binary(packet)).await {
+                                log::warn!("[UDP] chain upstream setup failed within deadline {deadline_secs}s: {e}");
+                                return Err(e.into());
+                            }
+                        }
+                        outgoing = Some(stream);
+                    }
+                    Err(e) => {
+                        log::warn!("[UDP] chain upstream setup failed within deadline {deadline_secs}s: {e}");
+                        queued.clear();
+                        return Err(e);
+                    }
+                }
+            }
             msg = async {
                 match outgoing.as_mut() {
                     Some(stream) => stream.next().await,
@@ -757,8 +916,14 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
             } => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
-                    Some(Err(err)) => return Err(err.into()),
-                    None => break,
+                    Some(Err(err)) => {
+                        cancel_pending(&mut pending).await;
+                        return Err(err.into());
+                    }
+                    None => {
+                        cancel_pending(&mut pending).await;
+                        break;
+                    }
                 };
                 link_health.on_inbound();
                 match msg {
@@ -782,20 +947,26 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             _ = link_check.tick() => {
+                if outgoing.is_none() || pending.is_some() {
+                    continue;
+                }
                 let stats = outgoing.as_ref().and_then(|stream| stream.get_ref().tcp_link_stats());
                 match link_health.poll(stats) {
                     crate::link_stall::LinkCheck::Reset(reason) => {
                         log::warn!("perf [UDP] chain upstream link stalled ({reason}), resetting");
-                        if let Err(e) = replace_chain_link(&mut outgoing, &chain, true).await {
-                            return Err(e);
-                        }
+                        outgoing = None;
+                        pending = Some(begin_chain_setup(&chain, true, "[UDP]"));
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: true } => {
-                        if let Some(stream) = &mut outgoing
-                            && let Err(e) = client::send_keepalive_ping(stream).await
-                        {
+                        let ping_error = if let Some(stream) = outgoing.as_mut() {
+                            client::send_keepalive_ping(stream).await.err()
+                        } else {
+                            None
+                        };
+                        if let Some(e) = ping_error {
                             log::warn!("perf [UDP] chain upstream {e}, resetting");
-                            replace_chain_link(&mut outgoing, &chain, true).await?;
+                            outgoing = None;
+                            pending = Some(begin_chain_setup(&chain, true, "[UDP]"));
                         }
                     }
                     crate::link_stall::LinkCheck::Ok { send_ping: false } => {}
@@ -805,7 +976,6 @@ pub(crate) async fn svr_udp_chain_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     }
     Ok(())
 }
-
 async fn svr_send_ws_message<S: AsyncRead + AsyncWrite + Unpin>(
     ws_stream: &mut WebSocketStream<S>,
     msg: Message,

@@ -20,6 +20,8 @@ The function is complete and the code is concise, and the core function is 1200 
 >         over_tls_enable && method == "none" && obfs == "plain" && protocol == "origin"
 > ```
 
+HTTP proxy clients can set `--http-session-timeout 60` to wait up to 60 seconds for the remote session confirmation (default: 15 seconds). This overrides `client_settings.http_session_timeout` in the JSON configuration. The value must be positive; this option is unavailable with `--c-api`.
+
 ## Principle
 
 In order to effectively deceive [GFW](https://en.wikipedia.org/wiki/Great_Firewall),
