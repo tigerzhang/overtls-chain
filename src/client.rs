@@ -181,6 +181,28 @@ where
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP proxy session timed out"))?
 }
 
+/// HTTP tunnels are not recycled, and must not inherit an unfinished SOCKS session.
+async fn create_http_ws_stream(config: &Config) -> std::io::Result<WsBoxStream> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let client = config.client.as_ref().ok_or("client not exist")?;
+        let addr = client.server_ip_addr().ok_or("server host")?;
+        let stream: BoxStream = if config.disable_tls() {
+            Box::new(crate::tcp_stream::tokio_create(addr).await?)
+        } else if client.dangerous_mode.unwrap_or(false) {
+            let domain = client.server_domain.as_ref().unwrap_or(&client.server_host);
+            Box::new(create_dangerous_tls_client_stream(addr, domain).await?)
+        } else {
+            let cert_store = retrieve_root_cert_store_for_client(&client.certificate_content())?;
+            let domain = client.server_domain.as_ref().unwrap_or(&client.server_host);
+            Box::new(create_tls_client_stream(cert_store, addr, domain).await?)
+        };
+        create_ws_stream(None, config, None, stream).await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP upstream connection timed out"))?
+    .map_err(std::io::Error::other)
+}
+
 async fn handle_listener_stream<M, S>(
     stream: TcpStream,
     auth: AuthAdaptor,
@@ -213,13 +235,21 @@ where
     };
     let src = stream.peer_addr()?;
     let connector: HttpConnector = Arc::new(move |dst| {
-        let pool = pool.clone();
+        let config = config.clone();
         Box::pin(async move {
-            // HTTP owns this link until close; it must never return an active session to the pool.
-            let mut ws = pool.get_connection().await.map_err(std::io::Error::other)?.into_inner();
+            // SOCKS sessions can leave unread data/EOF messages on recycled WebSockets.
+            // HTTP already closes its link after use, so establish a fresh one rather than
+            // interpreting a previous SOCKS session's messages as this request's result.
+            let mut ws = create_http_ws_stream(&config).await.map_err(|e| {
+                log::warn!("{src} HTTP upstream connection failed for {dst}: {e}");
+                e
+            })?;
             let command = format!("{START_SESSION}:{}", addess_to_b64str(&dst, false));
             ws.send(Message::Text(command.into())).await.map_err(std::io::Error::other)?;
-            wait_http_session(&mut ws).await?;
+            wait_http_session(&mut ws).await.map_err(|e| {
+                log::warn!("{src} HTTP session failed for {dst}: {e}");
+                e
+            })?;
             let (local, tunnel) = tokio::io::duplex(crate::STREAM_BUFFER_SIZE);
             tokio::spawn(async move {
                 if let Err(e) = client_traffic_loop(tunnel, &mut ws, src, dst, true).await {
@@ -638,7 +668,7 @@ where
     }
 }
 
-type BoxStream = Box<dyn AsyncReadWrite + Unpin + Send>;
+type BoxStream = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
 pub(crate) type WsBoxStream = WebSocketStream<BoxStream>;
 
 use connection_pool::{ConnectionManager, ConnectionPool};
@@ -1092,6 +1122,82 @@ mod http_proxy_tests {
         assert_eq!(reply, [5, 0]);
         quit.cancel();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_does_not_reuse_socks_socket_with_unread_eof() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+        let remote = tokio::spawn(async move {
+            let (probe, _) = upstream.accept().await.unwrap();
+            drop(probe);
+            let (old, _) = upstream.accept().await.unwrap();
+            let mut old = tokio_tungstenite::accept_async(old).await.unwrap();
+            // The socket is still live, but the previous SOCKS session left a frame unread.
+            old.send(Message::Text(REMOTE_EOF.into())).await.unwrap();
+            stale_tx.send(()).unwrap();
+
+            let (fresh, _) = upstream.accept().await.unwrap();
+            let mut fresh = tokio_tungstenite::accept_async(fresh).await.unwrap();
+            assert!(matches!(fresh.next().await.unwrap().unwrap(), Message::Text(text) if text.starts_with(START_SESSION)));
+            fresh.send(Message::Text(START_SESSION.into())).await.unwrap();
+            assert!(matches!(fresh.next().await.unwrap().unwrap(), Message::Binary(_)));
+            fresh
+                .send(Message::Binary(
+                    b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec().into(),
+                ))
+                .await
+                .unwrap();
+            fresh.send(Message::Text(REMOTE_EOF.into())).await.unwrap();
+            while let Some(Ok(message)) = fresh.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+            drop(old);
+        });
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "tunnel_path": "/test/",
+            "client_settings": {
+                "disable_tls": true, "server_host": "127.0.0.1", "server_port": addr.port(),
+                "listen_host": "127.0.0.1", "listen_port": 0
+            }
+        }))
+        .unwrap();
+        config.check_correctness(false).unwrap();
+        let pool = ConnectionPool::new(Some(1), None, None, None, WsPlainConnectionManager { config: config.clone() });
+        let old = pool.clone().get_connection().await.unwrap();
+        stale_rx.await.unwrap();
+        drop(old);
+        timeout(Duration::from_secs(3), async {
+            while pool.pool_size().await != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let handler_pool = pool.clone();
+        let handler = tokio::spawn(async move {
+            let (incoming, _) = listener.accept().await.unwrap();
+            let (udp_tx, _, incomings) = udprelay::create_udp_tunnel();
+            handle_listener_stream(incoming, Arc::new(NoAuth), config, udp_tx, incomings, handler_pool)
+                .await
+                .unwrap();
+        });
+        stream
+            .write_all(b"GET http://example.com/ HTTP/1.0\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let data = response(&mut stream).await;
+        assert!(data.starts_with(b"HTTP/1.0 200"));
+        assert!(data.ends_with(b"hello"));
+        assert_eq!(pool.pool_size().await, 1, "HTTP must leave the SOCKS pool untouched");
+        handler.await.unwrap();
+        timeout(Duration::from_secs(3), remote).await.unwrap().unwrap();
     }
 
     #[tokio::test]
