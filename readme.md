@@ -194,3 +194,14 @@ bash ./overtls-install-selfsign.sh
 >   so that you can skip the certificate verification. But this is very dangerous, it is easy to be attacked
 >   by [Man-in-the-middle](https://en.wikipedia.org/wiki/Man-in-the-middle_attack),
 >   and may steal your password and other sensitive information when you use network accounts.
+
+The client listener supports SOCKS5 and HTTP on the same `listen_host:listen_port`,
+including HTTP forwarding and HTTPS CONNECT. Both protocols use the optional
+`listen_user` / `listen_password` credentials. HTTP traffic follows the same
+OverTLS server and any configured server chain.
+
+```bash
+curl -x http://127.0.0.1:1080 https://example.com
+# With listener authentication:
+curl -x http://127.0.0.1:1080 --proxy-user user:password https://example.com
+```

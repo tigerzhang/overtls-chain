@@ -26,7 +26,7 @@ pub use config::{Client as ClientConfig, Config, ManageClients, Server as Server
 pub use dump_logger::overtls_set_log_callback;
 pub use error::{BoxError, Error, Result};
 pub use server::run_server;
-use socks5_impl::protocol::{Address, StreamOperation};
+use socks5_impl::{Address, StreamOperation};
 pub use tokio_util::sync::CancellationToken;
 pub use traffic_status::{TrafficStatus, overtls_set_traffic_status_callback};
 

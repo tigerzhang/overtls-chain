@@ -172,3 +172,13 @@ bash ./overtls-install-selfsign.sh
 >   這樣就可以跳過證書驗證了。但這樣做非常危險，容易遭到
 >   [中間人攻擊](https://zh.wikipedia.org/wiki/%E4%B8%AD%E9%97%B4%E4%BA%BA%E6%94%BB%E5%87%BB) ，
 >   可能會在你使用網絡帳號時被盜取密碼等敏感信息。請謹慎使用。
+
+客户端在同一 `listen_host:listen_port` 自动识别 SOCKS5 和 HTTP，支持普通 HTTP
+转发及 HTTPS CONNECT。两种协议共用可选的 `listen_user` / `listen_password`
+认证配置。HTTP 流量通过相同的 OverTLS 服务端及其配置的代理链转发。
+
+```bash
+curl -x http://127.0.0.1:1080 https://example.com
+# 配置了监听认证时：
+curl -x http://127.0.0.1:1080 --proxy-user user:password https://example.com
+```

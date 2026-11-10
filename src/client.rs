@@ -9,10 +9,12 @@ use crate::{
 };
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use socks_hub_core::{BoxedStream, HttpConnector, UserKey, run_http_service};
 use socks5_impl::{
-    protocol::{Address, Reply},
+    Address,
+    protocol::Reply,
     server::{
-        AuthAdaptor, ClientConnection, Connect, IncomingConnection, Server,
+        AuthAdaptor, ClientConnection, Connect, IncomingConnection,
         auth::{NoAuth, UserKeyAuth},
         connection::connect::NeedReply,
     },
@@ -23,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::{
@@ -62,15 +64,14 @@ where
     Ok(())
 }
 
-async fn _run_client<F, O>(config: &Config, auth: AuthAdaptor<O>, quit: crate::CancellationToken, callback: Option<F>) -> Result<()>
+async fn _run_client<F>(config: &Config, auth: AuthAdaptor, quit: crate::CancellationToken, callback: Option<F>) -> Result<()>
 where
     F: FnOnce(SocketAddr) + Send + Sync + 'static,
-    O: Send + Sync + 'static,
 {
     let client = config.client.as_ref().ok_or("client")?;
     let addr = SocketAddr::new(client.listen_host.parse()?, client.listen_port);
 
-    let server = Server::<O>::bind(addr, auth).await?;
+    let server = TcpListener::bind(addr).await?;
 
     let pool_max_size = client.pool_max_size.map_or(Some(crate::config::DEFAULT_POOL_MAX_SIZE), Some);
 
@@ -81,25 +82,25 @@ where
     if config.disable_tls() {
         let manager = WsPlainConnectionManager { config: config.clone() };
         let connection_pool = ConnectionPool::new(pool_max_size, None, None, None, manager);
-        client_event_loop::<_, TcpStream, _>(connection_pool, quit, server, config).await?;
+        client_event_loop::<_, TcpStream>(connection_pool, quit, server, auth, config).await?;
     } else {
         let manager = WsTlsConnectionManager { config: config.clone() };
         let connection_pool = ConnectionPool::new(pool_max_size, None, None, None, manager);
-        client_event_loop::<_, TlsStream<TcpStream>, _>(connection_pool, quit, server, config).await?;
+        client_event_loop::<_, TlsStream<TcpStream>>(connection_pool, quit, server, auth, config).await?;
     };
     Ok(())
 }
 
-async fn client_event_loop<M, S, O>(
+async fn client_event_loop<M, S>(
     pool: Arc<ConnectionPool<M>>,
     quit: crate::CancellationToken,
-    server: Server<O>,
+    server: TcpListener,
+    auth: AuthAdaptor,
     config: &Config,
 ) -> Result<()>
 where
     M: ConnectionManager<Connection = WebSocketStream<S>> + Send + Sync + 'static,
-    S: AsyncReadWrite + Unpin + Send + 'static,
-    O: Send + Sync + 'static,
+    S: AsyncReadWrite + Unpin + Send + Sync + 'static,
 {
     let (udp_tx, _, incomings) = udprelay::create_udp_tunnel();
     udprelay::udp_handler_watchdog(config, &incomings, &udp_tx, quit.clone()).await?;
@@ -142,10 +143,11 @@ where
                 let session_count = session_count.clone();
                 let peer_addr = conn.peer_addr()?;
                 let pool = pool.clone();
+                let auth = auth.clone();
                 tokio::spawn(async move {
                     let count = session_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     log::debug!("session #{session_id} from {peer_addr} started, session count {count}");
-                    if let Err(e) = handle_incoming(conn, config, Some(udp_tx), incomings, pool).await {
+                    if let Err(e) = handle_listener_stream(conn, auth, config, udp_tx, incomings, pool).await {
                         log::debug!("{peer_addr} {e}");
                     }
                     let count = session_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
@@ -161,20 +163,90 @@ where
 const LOCAL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SLOW_ACQUIRE: std::time::Duration = std::time::Duration::from_millis(200);
 
-async fn handle_incoming<IO, M, S>(
-    conn: IncomingConnection<IO>,
+async fn wait_http_session<S>(stream: &mut WebSocketStream<S>) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, async {
+        while let Some(message) = stream.next().await {
+            match message.map_err(std::io::Error::other)? {
+                Message::Text(text) if text.as_str() == START_SESSION => return Ok(()),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                _ => break,
+            }
+        }
+        Err(std::io::Error::other("remote HTTP proxy connection failed"))
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP proxy session timed out"))?
+}
+
+async fn handle_listener_stream<M, S>(
+    stream: TcpStream,
+    auth: AuthAdaptor,
+    config: Config,
+    udp_tx: udprelay::UdpRequestSender,
+    incomings: udprelay::SocketAddrHashSet,
+    pool: Arc<ConnectionPool<M>>,
+) -> Result<()>
+where
+    M: ConnectionManager<Connection = WebSocketStream<S>> + Send + Sync + 'static,
+    S: AsyncReadWrite + Unpin + Send + Sync + 'static,
+{
+    let mut first = [0];
+    let n = tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, stream.peek(&mut first))
+        .await
+        .map_err(|_| Error::from("local protocol detection timed out"))??;
+    if n == 0 {
+        return Ok(());
+    }
+    if first[0] == 5 {
+        return handle_incoming(IncomingConnection::new(stream, auth), config, Some(udp_tx), incomings, pool).await;
+    }
+    if !first[0].is_ascii_alphabetic() {
+        return Ok(());
+    }
+    let client = config.client.as_ref().ok_or("client")?;
+    let credentials = match client.listen_user.as_deref().filter(|s| !s.is_empty()) {
+        Some(user) => UserKey::new(user, client.listen_password.as_deref().unwrap_or("")),
+        None => UserKey::default(),
+    };
+    let src = stream.peer_addr()?;
+    let connector: HttpConnector = Arc::new(move |dst| {
+        let pool = pool.clone();
+        Box::pin(async move {
+            // HTTP owns this link until close; it must never return an active session to the pool.
+            let mut ws = pool.get_connection().await.map_err(std::io::Error::other)?.into_inner();
+            let command = format!("{START_SESSION}:{}", addess_to_b64str(&dst, false));
+            ws.send(Message::Text(command.into())).await.map_err(std::io::Error::other)?;
+            wait_http_session(&mut ws).await?;
+            let (local, tunnel) = tokio::io::duplex(crate::STREAM_BUFFER_SIZE);
+            tokio::spawn(async move {
+                if let Err(e) = client_traffic_loop(tunnel, &mut ws, src, dst, true).await {
+                    log::debug!("{src} HTTP tunnel ended: {e}");
+                }
+                let _ = ws.close(None).await;
+            });
+            Ok(Box::new(local) as BoxedStream)
+        })
+    });
+    run_http_service(stream, connector, credentials).await?;
+    Ok(())
+}
+
+async fn handle_incoming<M, S>(
+    conn: IncomingConnection,
     config: Config,
     udp_tx: Option<udprelay::UdpRequestSender>,
     incomings: udprelay::SocketAddrHashSet,
     pool: Arc<ConnectionPool<M>>,
 ) -> Result<()>
 where
-    IO: 'static,
     M: ConnectionManager<Connection = WebSocketStream<S>> + Send + Sync + 'static,
-    S: AsyncReadWrite + Unpin + Send + 'static,
+    S: AsyncReadWrite + Unpin + Send + Sync + 'static,
 {
     let peer_addr = conn.peer_addr()?;
-    let (conn, _res) = match tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, conn.authenticate()).await {
+    let conn = match tokio::time::timeout(LOCAL_HANDSHAKE_TIMEOUT, conn.authenticate()).await {
         Ok(res) => res?,
         Err(_) => {
             log::warn!("perf {peer_addr} socks authenticate timed out after {LOCAL_HANDSHAKE_TIMEOUT:?}");
@@ -195,12 +267,12 @@ where
                     log::debug!("{peer_addr} handle_s5_upd_associate \"{e}\"");
                 }
             } else {
-                let mut conn = asso.reply(Reply::CommandNotSupported, Address::unspecified()).await?;
+                let mut conn = asso.reply(Reply::CommandNotSupported, Address::unspecified_v4()).await?;
                 conn.shutdown().await?;
             }
         }
         ClientConnection::Bind(bind, _) => {
-            let mut conn = bind.reply(Reply::CommandNotSupported, Address::unspecified()).await?;
+            let mut conn = bind.reply(Reply::CommandNotSupported, Address::unspecified_v4()).await?;
             conn.shutdown().await?;
         }
         ClientConnection::Connect(connect, addr) => {
@@ -221,7 +293,7 @@ where
                 Ok(stream) => stream,
                 Err(e) => {
                     log::warn!("perf pool acquire failed for {peer_addr} -> {addr}: {e}");
-                    let mut failed = connect.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+                    let mut failed = connect.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
                     let _ = failed.shutdown().await;
                     return Ok(());
                 }
@@ -251,19 +323,25 @@ async fn handle_socks5_cmd_connection<S>(
     ws_stream: &mut WebSocketStream<S>,
 ) -> Result<()>
 where
-    S: AsyncReadWrite + Unpin + Send + 'static,
+    S: AsyncReadWrite + Unpin + Send + Sync + 'static,
 {
-    let incoming = connect.reply(Reply::Succeeded, Address::unspecified()).await?;
+    let incoming = connect.reply(Reply::Succeeded, Address::unspecified_v4()).await?;
 
     let peer_addr = incoming.peer_addr()?;
 
     log::trace!("{peer_addr} -> {target_addr} tunnel establishing");
 
-    client_traffic_loop(incoming, ws_stream, peer_addr, target_addr).await?;
+    client_traffic_loop(incoming, ws_stream, peer_addr, target_addr, false).await?;
     Ok(())
 }
 
-async fn client_traffic_loop<T, S>(mut incoming: T, ws_stream: &mut WebSocketStream<S>, src: SocketAddr, dst: Address) -> Result<()>
+async fn client_traffic_loop<T, S>(
+    mut incoming: T,
+    ws_stream: &mut WebSocketStream<S>,
+    src: SocketAddr,
+    dst: Address,
+    mut session_confirmed: bool,
+) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
     S: AsyncReadWrite + Unpin,
@@ -271,12 +349,13 @@ where
     // Send "Start session" command with target address
     let b64_addr = addess_to_b64str(&dst, false);
     let start_cmd = format!("{START_SESSION}:{b64_addr}");
-    ws_stream.send(Message::Text(start_cmd.into())).await?;
+    if !session_confirmed {
+        ws_stream.send(Message::Text(start_cmd.into())).await?;
+    }
 
     let mut link_health = crate::link_stall::LinkHealth::new();
     let mut link_check = tokio::time::interval(crate::link_stall::CHECK_INTERVAL);
     link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut session_confirmed = false;
     let mut shutdown_deadline: Option<tokio::time::Instant> = None;
     loop {
         let mut buf = BytesMut::with_capacity(crate::STREAM_BUFFER_SIZE);
@@ -372,7 +451,7 @@ where
                 }
             }
             _ = async {
-                if let Some(deadline) = shutdown_deadline.take() {
+                if let Some(deadline) = shutdown_deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
                     futures_util::future::pending::<()>().await;
@@ -831,5 +910,198 @@ mod tests {
         a_server.await.unwrap()?;
         b_server.await.unwrap()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod http_proxy_tests {
+    use super::*;
+    use tokio::time::{Duration, timeout};
+
+    async fn proxy(auth: bool) -> (TcpStream, crate::CancellationToken, tokio::task::JoinHandle<()>) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            // Configuration validation first probes the upstream TCP port.
+            let (probe, _) = upstream.accept().await.unwrap();
+            drop(probe);
+            let mut ws = loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let mut udp = false;
+                let ws = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                        udp = req.headers().contains_key("udp-tunnel");
+                        Ok(resp)
+                    },
+                )
+                .await
+                .unwrap();
+                if !udp {
+                    break ws;
+                }
+                tokio::spawn(async move {
+                    let mut ws = ws;
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            };
+            let start = ws.next().await.unwrap().unwrap();
+            let Message::Text(start) = start else {
+                panic!("missing session command")
+            };
+            let target = crate::b64str_to_address(start.strip_prefix(&format!("{START_SESSION}:")).unwrap(), false).unwrap();
+            assert_eq!(target.to_string(), "example.com:80");
+            ws.send(Message::Text(START_SESSION.into())).await.unwrap();
+            let request = ws.next().await.unwrap().unwrap();
+            let Message::Binary(request) = request else {
+                panic!("missing request")
+            };
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with("GET / ") || request.starts_with("GET http://example.com/ "),
+                "{request}"
+            );
+            assert!(!request.to_ascii_lowercase().contains("proxy-authorization"));
+            ws.send(Message::Binary(b"HTTP/1.0 200 OK\r\n\r\nhello".to_vec().into()))
+                .await
+                .unwrap();
+            ws.send(Message::Text(REMOTE_EOF.into())).await.unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                if msg.is_close() {
+                    break;
+                }
+            }
+        });
+        let mut config = Config {
+            tunnel_path: crate::config::TunnelPath::Single("/test/".into()),
+            client: Some(
+                serde_json::from_value(serde_json::json!({
+                    "disable_tls": true,
+                    "server_host": "127.0.0.1",
+                    "server_port": upstream_addr.port(),
+                    "listen_host": "127.0.0.1",
+                    "listen_port": 0,
+                    "listen_user": auth.then_some("alice"),
+                    "listen_password": auth.then_some("secret"),
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        config.check_correctness(false).unwrap();
+        let quit = crate::CancellationToken::new();
+        let stop = quit.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_client(
+                &config,
+                stop,
+                Some(move |addr| {
+                    let _ = tx.send(addr);
+                }),
+            )
+            .await
+            .unwrap();
+            remote.abort();
+        });
+        let stream = TcpStream::connect(rx.await.unwrap()).await.unwrap();
+        (stream, quit, task)
+    }
+
+    async fn response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut data = Vec::new();
+        timeout(Duration::from_secs(3), stream.read_to_end(&mut data))
+            .await
+            .unwrap()
+            .unwrap();
+        data
+    }
+
+    #[tokio::test]
+    async fn forwards_fragmented_http_until_remote_eof() {
+        let (mut stream, quit, task) = proxy(false).await;
+        stream.write_all(b"G").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stream
+            .write_all(b"ET http://example.com/ HTTP/1.0\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let data = response(&mut stream).await;
+        assert!(data.starts_with(b"HTTP/1.0 200"));
+        assert!(data.ends_with(b"hello"));
+        quit.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_tunnels_bytes() {
+        let (mut stream, quit, task) = proxy(false).await;
+        stream
+            .write_all(b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n")
+            .await
+            .unwrap();
+        let mut header = Vec::new();
+        timeout(Duration::from_secs(3), async {
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(header.starts_with(b"HTTP/1.1 200"));
+        stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        assert!(response(&mut stream).await.ends_with(b"hello"));
+        quit.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticates_http_requests() {
+        let (mut stream, quit, task) = proxy(true).await;
+        stream
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut header = Vec::new();
+        timeout(Duration::from_secs(3), async {
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(header.starts_with(b"HTTP/1.1 407"));
+        stream
+            .write_all(b"GET http://example.com/ HTTP/1.0\r\nHost: example.com\r\nProxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(response(&mut stream).await.ends_with(b"hello"));
+        quit.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn still_accepts_socks5() {
+        let (mut stream, quit, task) = proxy(false).await;
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        timeout(Duration::from_secs(3), stream.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, [5, 0]);
+        quit.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_failed_remote_session() {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        server.send(Message::Text(START_SESSION.into())).await.unwrap();
+        wait_http_session(&mut client).await.unwrap();
+        server.send(Message::Text(END_SESSION.into())).await.unwrap();
+        assert!(wait_http_session(&mut client).await.is_err());
     }
 }

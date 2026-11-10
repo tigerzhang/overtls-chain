@@ -8,7 +8,8 @@ use async_shared_timeout::{Timeout, runtime};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use socks5_impl::{
-    protocol::{Address, Reply, StreamOperation, UdpHeader},
+    Address, StreamOperation,
+    protocol::{Reply, UdpHeader},
     server::{
         UdpAssociate,
         connection::associate::{AssociatedUdpSocket, NeedReply as UdpNeedReply},
@@ -90,7 +91,7 @@ pub(crate) async fn handle_s5_upd_associate(
             res
         }
         Err(err) => {
-            let mut conn = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            let mut conn = associate.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
             conn.shutdown().await?;
             Err(err.into())
         }
